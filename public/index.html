@@ -10,12 +10,11 @@
     />
     <link rel="stylesheet" href="/styles.css" />
   </head>
-  <body data-runtime="booting">
+  <body>
     <div class="app-shell">
       <div class="bg-grid"></div>
       <div class="scanlines"></div>
       <div class="vignette"></div>
-      <div class="noise-layer"></div>
 
       <header class="topbar panel frame-corners">
         <div class="topbar__left">
@@ -25,222 +24,301 @@
             <div class="system-mark__sub">EVA-inspired multi-agent runtime / OpenAI Responses orchestration</div>
           </div>
         </div>
+
         <div class="topbar__center">
           <div class="status-strip">
             <div class="status-chip"><span class="dot" id="dotSystem"></span><span id="systemStatus">BOOTING</span></div>
             <div class="status-chip"><span class="dot" id="dotApi"></span><span id="apiStatus">API CHECK</span></div>
             <div class="status-chip"><span class="dot" id="dotSession"></span><span id="sessionStatus">SESSION INIT</span></div>
           </div>
+          <div class="toolbar">
+            <button type="button" class="toolbar-button" data-panel-toggle="controlsPanel">CTRL</button>
+            <button type="button" class="toolbar-button" data-panel-toggle="telemetryPanel">TEL</button>
+            <button type="button" class="toolbar-button" data-panel-toggle="teamsPanel">TEAM</button>
+            <button type="button" class="toolbar-button" data-panel-toggle="eventsPanel">LOG</button>
+          </div>
         </div>
-        <div class="topbar__right mono small">
-          <div id="runtimeClock">--:--:--</div>
-          <div id="sessionTag">SESSION // -----</div>
-          <div id="originTag">ORIGIN // --</div>
+
+        <div class="topbar__right">
+          <div class="topbar__runtime mono small">
+            <div id="runtimeClock">--:--:--</div>
+            <div id="sessionTag">SESSION // -----</div>
+          </div>
         </div>
       </header>
 
-      <main class="layout">
-        <section class="controls panel frame-corners">
+      <main class="layout" id="layoutRoot">
+        <section class="controls panel frame-corners" id="controlsPanel" data-panel>
           <div class="panel-title">
-            <span class="panel-title__en">MISSION CONTROL</span>
-            <span class="panel-title__jp">作戰指令</span>
+            <div>
+              <span class="panel-title__en">MISSION CONTROL</span>
+              <span class="panel-title__jp">作戰指令</span>
+            </div>
+            <div class="panel-actions">
+              <button type="button" class="ghost-toggle" data-panel-toggle="controlsPanel">FOLD</button>
+            </div>
           </div>
 
-          <label class="field-label" for="missionInput">Mission</label>
-          <textarea id="missionInput" class="mission-input" spellcheck="false">
+          <div class="panel-body">
+            <div class="fold-stack">
+              <section class="fold-block" data-fold="mission">
+                <button type="button" class="fold-toggle" data-fold-toggle="mission">
+                  <span>MISSION BRIEF</span>
+                  <span class="fold-toggle__meta">輸入任務</span>
+                </button>
+                <div class="fold-body">
+                  <label class="field-label" for="missionInput">Mission</label>
+                  <textarea id="missionInput" class="mission-input" spellcheck="false">
 研究 EVA 裡的 MAGI 與 multi-agent 的對應關係，並設計一個可執行的 JS 版 MAGI 系統：動態子代理、動態生成多個團隊、支援多種協作模式、EVA/MAGI 風格動態介面、真實 OpenAI API 與 LLM 層。
-          </textarea>
+                  </textarea>
+                </div>
+              </section>
 
-          <div class="mission-digest frame-inline">
-            <div class="mission-digest__row"><span class="label-key">MISSION HASH</span><span id="missionHash" class="mono">--------</span></div>
-            <div class="mission-digest__row"><span class="label-key">CHAR COUNT</span><span id="missionLength" class="mono">0</span></div>
-          </div>
+              <section class="fold-block" data-fold="presets">
+                <button type="button" class="fold-toggle" data-fold-toggle="presets">
+                  <span>MISSION PRESETS</span>
+                  <span class="fold-toggle__meta">快速填入</span>
+                </button>
+                <div class="fold-body">
+                  <div class="preset-row" id="presetRow"></div>
+                </div>
+              </section>
 
-          <div class="preset-row" id="presetRow"></div>
+              <section class="fold-block" data-fold="settings">
+                <button type="button" class="fold-toggle" data-fold-toggle="settings">
+                  <span>RUNTIME SETTINGS</span>
+                  <span class="fold-toggle__meta">可摺疊設定</span>
+                </button>
+                <div class="fold-body">
+                  <div class="control-grid">
+                    <label>
+                      <span class="field-label">Mode</span>
+                      <select id="modeSelect"></select>
+                    </label>
+                    <label>
+                      <span class="field-label">Max teams</span>
+                      <input id="maxTeams" type="number" min="2" max="6" value="6" />
+                    </label>
+                    <label>
+                      <span class="field-label">Agents / team</span>
+                      <input id="maxAgents" type="number" min="2" max="4" value="4" />
+                    </label>
+                    <label>
+                      <span class="field-label">Rounds</span>
+                      <input id="maxRounds" type="number" min="1" max="3" value="2" />
+                    </label>
+                  </div>
 
-          <div class="control-grid">
-            <label>
-              <span class="field-label">Mode</span>
-              <select id="modeSelect"></select>
-            </label>
-            <label>
-              <span class="field-label">Max teams</span>
-              <input id="maxTeams" type="number" min="2" max="4" value="3" />
-            </label>
-            <label>
-              <span class="field-label">Agents / team</span>
-              <input id="maxAgents" type="number" min="2" max="4" value="3" />
-            </label>
-            <label>
-              <span class="field-label">Rounds</span>
-              <input id="maxRounds" type="number" min="1" max="3" value="2" />
-            </label>
-          </div>
+                  <div class="toggle-row">
+                    <label class="toggle">
+                      <input type="checkbox" id="preferAllPatterns" checked />
+                      <span>Prefer all collaboration patterns</span>
+                    </label>
+                    <label class="toggle">
+                      <input type="checkbox" id="enableWebSearch" />
+                      <span>Enable built-in web_search tool</span>
+                    </label>
+                  </div>
+                </div>
+              </section>
 
-          <div class="toggle-row">
-            <label class="toggle">
-              <input type="checkbox" id="preferAllPatterns" checked />
-              <span>Prefer all collaboration patterns</span>
-            </label>
-            <label class="toggle">
-              <input type="checkbox" id="enableWebSearch" />
-              <span>Enable built-in web_search tool</span>
-            </label>
-          </div>
+              <section class="fold-block" data-fold="actions">
+                <button type="button" class="fold-toggle" data-fold-toggle="actions">
+                  <span>CONSOLE ACTIONS</span>
+                  <span class="fold-toggle__meta">控制與狀態</span>
+                </button>
+                <div class="fold-body">
+                  <div class="button-row">
+                    <button id="runButton" class="primary-button">START MAGI CYCLE</button>
+                    <button id="newSessionButton" class="secondary-button">NEW SESSION</button>
+                  </div>
 
-          <div class="button-row">
-            <button id="runButton" class="primary-button">START MAGI CYCLE</button>
-            <button id="newSessionButton" class="secondary-button">NEW SESSION</button>
-          </div>
-
-          <div class="info-list mono small">
-            <div><span class="label-key">API BASE</span><span id="apiBaseValue">--</span></div>
-            <div><span class="label-key">MODE</span><span id="runtimeModeValue">--</span></div>
-            <div><span class="label-key">PHASE</span><span id="phaseValue">IDLE</span></div>
+                  <div class="info-list mono small">
+                    <div><span class="label-key">API BASE</span><span id="apiBaseValue">--</span></div>
+                    <div><span class="label-key">MODE</span><span id="runtimeModeValue">--</span></div>
+                    <div><span class="label-key">PHASE</span><span id="phaseValue">IDLE</span></div>
+                    <div><span class="label-key">TOPOLOGY</span><span id="topologySummaryValue">PENDING</span></div>
+                    <div><span class="label-key">PATTERNS</span><span id="patternCoverageValue">0</span></div>
+                  </div>
+                </div>
+              </section>
+            </div>
           </div>
         </section>
 
-        <section class="stage panel frame-corners">
+        <section class="stage panel frame-corners" id="stagePanel" data-panel>
           <div class="panel-title center-title">
-            <span class="panel-title__en">MAGI DECISION CHAMBER</span>
-            <span class="panel-title__jp">思考會議中樞</span>
+            <div>
+              <span class="panel-title__en">MAGI DECISION CHAMBER</span>
+              <span class="panel-title__jp">思考會議中樞</span>
+            </div>
           </div>
 
-          <div class="stage-canvas" id="stageCanvas">
-            <div class="stage-sweep"></div>
-            <div class="stage-radar"></div>
-            <div class="stage-status-banner mono" id="stageBanner">PRIMARY ARBITRATION BUS // STANDBY</div>
-
-            <div class="stage-overlay stage-overlay--top">
-              <div class="hud-stat">
-                <span class="hud-stat__label">TEAMS</span>
-                <strong class="hud-stat__value mono" id="teamsCount">00</strong>
-              </div>
-              <div class="hud-stat">
-                <span class="hud-stat__label">AGENTS</span>
-                <strong class="hud-stat__value mono" id="agentsCount">00</strong>
-              </div>
-              <div class="hud-stat">
-                <span class="hud-stat__label">TASKS</span>
-                <strong class="hud-stat__value mono" id="tasksCount">00</strong>
-              </div>
-              <div class="hud-stat">
-                <span class="hud-stat__label">BLACKBOARD</span>
-                <strong class="hud-stat__value mono" id="blackboardCount">00</strong>
-              </div>
+          <div class="panel-body">
+            <div class="stage-hud">
+              <div class="hud-stat"><span class="hud-stat__label">TEAMS</span><strong id="hudTeamCount">0</strong></div>
+              <div class="hud-stat"><span class="hud-stat__label">AGENTS</span><strong id="hudAgentCount">0</strong></div>
+              <div class="hud-stat"><span class="hud-stat__label">TASKS</span><strong id="hudTaskCount">0</strong></div>
+              <div class="hud-stat"><span class="hud-stat__label">PATTERNS</span><strong id="hudPatternCount">0</strong></div>
             </div>
 
-            <svg id="orbitLinks" class="orbit-links" viewBox="0 0 1000 760" preserveAspectRatio="none"></svg>
+            <div class="stage-banner frame-corners">
+              <div class="stage-banner__label mono">MISSION DIGEST</div>
+              <div class="stage-banner__text" id="missionDigest">Awaiting mission input.</div>
+              <div class="stage-banner__meta mono small" id="topologyHealthText">Topology health pending.</div>
+            </div>
 
-            <div class="magi-core" id="magiCore">
-              <div class="ring ring-a"></div>
-              <div class="ring ring-b"></div>
-              <div class="ring ring-c"></div>
-              <div class="ring ring-d"></div>
-              <div class="cross cross-h"></div>
-              <div class="cross cross-v"></div>
-              <div class="core-grid"></div>
-              <div class="core-labels">
-                <div class="core-center-tag mono">M.A.G.I.</div>
-                <div class="core-majority" id="majorityVoteDisplay">PENDING</div>
-                <div class="core-summary" id="majoritySummary">Awaiting topology synthesis.</div>
+            <div class="stage-canvas" id="stageCanvas" data-layout-mode="ellipse">
+              <div class="stage-radar"></div>
+              <div class="stage-sweep"></div>
+              <svg id="orbitLinks" class="orbit-links" viewBox="0 0 1000 760" preserveAspectRatio="none"></svg>
+
+              <div class="magi-core" id="magiCore">
+                <div class="ring ring-a"></div>
+                <div class="ring ring-b"></div>
+                <div class="ring ring-c"></div>
+                <div class="ring ring-d"></div>
+                <div class="cross cross-h"></div>
+                <div class="cross cross-v"></div>
+                <div class="core-grid"></div>
+                <div class="core-labels">
+                  <div class="core-center-tag mono">M.A.G.I.</div>
+                  <div class="core-majority" id="majorityVoteDisplay">PENDING</div>
+                  <div class="core-summary" id="majoritySummary">Awaiting topology synthesis.</div>
+                </div>
               </div>
-            </div>
 
-            <div class="core-node core-node--melchior" id="coreMelchior">
-              <div class="core-node__title">MELCHIOR-1</div>
-              <div class="core-node__axis">Scientist axis</div>
-              <div class="core-node__vote" id="voteMelchior">PENDING</div>
-            </div>
+              <div class="core-node core-node--melchior" id="coreMelchior">
+                <div class="core-node__title">MELCHIOR-1</div>
+                <div class="core-node__axis">Scientist axis</div>
+                <div class="core-node__vote" id="voteMelchior">PENDING</div>
+              </div>
 
-            <div class="core-node core-node--balthasar" id="coreBalthasar">
-              <div class="core-node__title">BALTHASAR-2</div>
-              <div class="core-node__axis">Mother axis</div>
-              <div class="core-node__vote" id="voteBalthasar">PENDING</div>
-            </div>
+              <div class="core-node core-node--balthasar" id="coreBalthasar">
+                <div class="core-node__title">BALTHASAR-2</div>
+                <div class="core-node__axis">Mother axis</div>
+                <div class="core-node__vote" id="voteBalthasar">PENDING</div>
+              </div>
 
-            <div class="core-node core-node--casper" id="coreCasper">
-              <div class="core-node__title">CASPER-3</div>
-              <div class="core-node__axis">Woman axis</div>
-              <div class="core-node__vote" id="voteCasper">PENDING</div>
-            </div>
+              <div class="core-node core-node--casper" id="coreCasper">
+                <div class="core-node__title">CASPER-3</div>
+                <div class="core-node__axis">Woman axis</div>
+                <div class="core-node__vote" id="voteCasper">PENDING</div>
+              </div>
 
-            <div id="teamOrbit" class="team-orbit"></div>
-
-            <div class="stage-overlay stage-overlay--bottom">
-              <div class="hud-ribbon mono" id="missionDigest">MISSION // STANDBY</div>
-              <div class="hud-ribbon mono" id="patternCoverage">PATTERNS // --</div>
+              <div id="teamOrbit" class="team-orbit"></div>
             </div>
           </div>
         </section>
 
-        <aside class="telemetry panel frame-corners">
+        <aside class="telemetry panel frame-corners" id="telemetryPanel" data-panel>
           <div class="panel-title">
-            <span class="panel-title__en">TELEMETRY</span>
-            <span class="panel-title__jp">監視記錄</span>
+            <div>
+              <span class="panel-title__en">TELEMETRY</span>
+              <span class="panel-title__jp">監視記錄</span>
+            </div>
+            <div class="panel-actions">
+              <button type="button" class="ghost-toggle" data-panel-toggle="telemetryPanel">FOLD</button>
+            </div>
           </div>
 
-          <div class="telemetry-section">
-            <div class="subsection-title">Execution Phases</div>
-            <div id="phaseTimeline" class="phase-timeline"></div>
-          </div>
+          <div class="panel-body fold-stack">
+            <section class="fold-block" data-fold="timeline">
+              <button type="button" class="fold-toggle" data-fold-toggle="timeline">
+                <span>EXECUTION PHASES</span>
+                <span class="fold-toggle__meta">階段時間線</span>
+              </button>
+              <div class="fold-body">
+                <div id="phaseTimeline" class="phase-timeline"></div>
+              </div>
+            </section>
 
-          <div class="telemetry-section">
-            <div class="subsection-title">Shared Blackboard</div>
-            <div id="blackboardList" class="blackboard-list"></div>
-          </div>
+            <section class="fold-block" data-fold="blackboard">
+              <button type="button" class="fold-toggle" data-fold-toggle="blackboard">
+                <span>SHARED BLACKBOARD</span>
+                <span class="fold-toggle__meta">共享黑板</span>
+              </button>
+              <div class="fold-body">
+                <div id="blackboardList" class="blackboard-list"></div>
+              </div>
+            </section>
 
-          <div class="telemetry-section">
-            <div class="subsection-title">Decision Memo</div>
-            <div id="decisionMemo" class="decision-memo">No final report yet.</div>
+            <section class="fold-block" data-fold="memo">
+              <button type="button" class="fold-toggle" data-fold-toggle="memo">
+                <span>DECISION MEMO</span>
+                <span class="fold-toggle__meta">最終決策</span>
+              </button>
+              <div class="fold-body">
+                <div id="decisionMemo" class="decision-memo">No final report yet.</div>
+              </div>
+            </section>
           </div>
         </aside>
 
-        <section class="teams panel frame-corners">
+        <section class="teams panel frame-corners" id="teamsPanel" data-panel>
           <div class="panel-title">
-            <span class="panel-title__en">DYNAMIC TEAMS</span>
-            <span class="panel-title__jp">團隊生成狀態</span>
+            <div>
+              <span class="panel-title__en">DYNAMIC TEAMS</span>
+              <span class="panel-title__jp">團隊生成狀態</span>
+            </div>
+            <div class="panel-actions">
+              <button type="button" class="ghost-toggle" id="expandTeamsButton">EXPAND</button>
+              <button type="button" class="ghost-toggle" id="collapseTeamsButton">COLLAPSE</button>
+              <button type="button" class="ghost-toggle" data-panel-toggle="teamsPanel">FOLD</button>
+            </div>
           </div>
-          <div id="teamsGrid" class="teams-grid"></div>
+          <div class="panel-body">
+            <div id="teamsGrid" class="teams-grid"></div>
+          </div>
         </section>
 
-        <section class="events panel frame-corners">
+        <section class="events panel frame-corners" id="eventsPanel" data-panel>
           <div class="panel-title">
-            <span class="panel-title__en">EVENT LOG</span>
-            <span class="panel-title__jp">事件流</span>
+            <div>
+              <span class="panel-title__en">EVENT LOG</span>
+              <span class="panel-title__jp">事件流</span>
+            </div>
+            <div class="panel-actions">
+              <button type="button" class="ghost-toggle" id="clearLogButton">CLEAR</button>
+              <button type="button" class="ghost-toggle" data-panel-toggle="eventsPanel">FOLD</button>
+            </div>
           </div>
-          <div id="eventLog" class="event-log mono"></div>
+          <div class="panel-body">
+            <div id="eventLog" class="event-log mono"></div>
+          </div>
         </section>
       </main>
     </div>
 
     <template id="teamCardTemplate">
       <article class="team-card">
-        <div class="team-card__beam"></div>
         <div class="team-card__head">
-          <div>
+          <div class="team-card__identity">
             <div class="team-card__name"></div>
             <div class="team-card__meta mono"></div>
           </div>
-          <div class="team-card__status"></div>
+          <div class="team-card__head-actions">
+            <div class="team-card__status"></div>
+            <button type="button" class="team-card__toggle ghost-toggle" data-team-toggle>DETAIL</button>
+          </div>
         </div>
-        <div class="team-card__badges">
-          <span class="team-card__badge team-card__badge--pattern"></span>
-          <span class="team-card__badge team-card__badge--depends"></span>
-          <span class="team-card__badge team-card__badge--deliverable"></span>
-        </div>
-        <div class="team-card__goal"></div>
-        <div class="team-card__section">
-          <div class="team-card__label">AGENTS</div>
-          <div class="team-card__agents"></div>
-        </div>
-        <div class="team-card__section">
-          <div class="team-card__label">TASKS</div>
-          <div class="team-card__tasks"></div>
-        </div>
-        <div class="team-card__section">
-          <div class="team-card__label">SYNTHESIS</div>
-          <div class="team-card__result"></div>
+        <div class="team-card__stats"></div>
+        <div class="team-card__body">
+          <div class="team-card__goal"></div>
+          <div class="team-card__deliverable"></div>
+          <div class="team-card__deps"></div>
+          <div class="team-card__section">
+            <div class="team-card__section-title">AGENTS</div>
+            <div class="team-card__agents"></div>
+          </div>
+          <div class="team-card__section">
+            <div class="team-card__section-title">TASKS</div>
+            <div class="team-card__tasks"></div>
+          </div>
+          <div class="team-card__section">
+            <div class="team-card__section-title">RESULT</div>
+            <div class="team-card__result"></div>
+          </div>
         </div>
       </article>
     </template>
@@ -251,11 +329,9 @@
           <div class="orbit-node__name"></div>
           <div class="orbit-node__pattern mono"></div>
         </div>
+        <div class="orbit-node__meta"></div>
         <div class="orbit-node__state"></div>
         <div class="orbit-node__agents"></div>
-        <div class="orbit-node__footer">
-          <div class="orbit-node__meta mono"></div>
-        </div>
       </div>
     </template>
 

@@ -13,6 +13,8 @@ const PRESETS = [
   '設計一個可用於 research / coding / architecture review 的 MAGI runtime，要求具備 web_search、structured outputs、真實 LLM 評議與投票。',
 ];
 
+const UI_STORAGE_KEY = 'magi-eva-ui-v4';
+
 const state = {
   config: null,
   hasApiKey: false,
@@ -21,6 +23,7 @@ const state = {
   running: false,
   phases: new Map(PHASE_DEFS.map((phase) => [phase.key, { ...phase, status: 'idle' }])),
   topology: null,
+  topologyHealth: null,
   teamOrder: [],
   teams: new Map(),
   blackboard: [],
@@ -32,11 +35,17 @@ const state = {
   },
   finalResult: null,
   apiBase: '',
-  stageObserver: null,
+  ui: {
+    collapsedPanels: new Set(),
+    foldedSections: new Set(),
+    collapsedTeams: new Set(),
+    touchedTeamCards: false,
+  },
 };
 
 const $ = (selector) => document.querySelector(selector);
 const refs = {
+  layoutRoot: $('#layoutRoot'),
   dotSystem: $('#dotSystem'),
   dotApi: $('#dotApi'),
   dotSession: $('#dotSession'),
@@ -45,13 +54,12 @@ const refs = {
   sessionStatus: $('#sessionStatus'),
   runtimeClock: $('#runtimeClock'),
   sessionTag: $('#sessionTag'),
-  originTag: $('#originTag'),
   apiBaseValue: $('#apiBaseValue'),
   runtimeModeValue: $('#runtimeModeValue'),
   phaseValue: $('#phaseValue'),
+  topologySummaryValue: $('#topologySummaryValue'),
+  patternCoverageValue: $('#patternCoverageValue'),
   missionInput: $('#missionInput'),
-  missionHash: $('#missionHash'),
-  missionLength: $('#missionLength'),
   modeSelect: $('#modeSelect'),
   maxTeams: $('#maxTeams'),
   maxAgents: $('#maxAgents'),
@@ -69,13 +77,6 @@ const refs = {
   teamOrbit: $('#teamOrbit'),
   orbitLinks: $('#orbitLinks'),
   stageCanvas: $('#stageCanvas'),
-  teamsCount: $('#teamsCount'),
-  agentsCount: $('#agentsCount'),
-  tasksCount: $('#tasksCount'),
-  blackboardCount: $('#blackboardCount'),
-  missionDigest: $('#missionDigest'),
-  patternCoverage: $('#patternCoverage'),
-  stageBanner: $('#stageBanner'),
   majorityVoteDisplay: $('#majorityVoteDisplay'),
   majoritySummary: $('#majoritySummary'),
   voteMelchior: $('#voteMelchior'),
@@ -86,17 +87,30 @@ const refs = {
   coreCasper: $('#coreCasper'),
   teamCardTemplate: $('#teamCardTemplate'),
   orbitNodeTemplate: $('#orbitNodeTemplate'),
+  clearLogButton: $('#clearLogButton'),
+  expandTeamsButton: $('#expandTeamsButton'),
+  collapseTeamsButton: $('#collapseTeamsButton'),
+  hudTeamCount: $('#hudTeamCount'),
+  hudAgentCount: $('#hudAgentCount'),
+  hudTaskCount: $('#hudTaskCount'),
+  hudPatternCount: $('#hudPatternCount'),
+  missionDigest: $('#missionDigest'),
+  topologyHealthText: $('#topologyHealthText'),
 };
 
+let stageObserver = null;
+
 window.addEventListener('DOMContentLoaded', init);
-window.addEventListener('resize', debounce(() => renderOrbit(), 80));
 
 async function init() {
-  startClock();
+  loadUiState();
   bindUi();
-  setupAdaptiveStage();
   renderPresets();
-  updateRuntimeVisualState('booting');
+  startClock();
+  observeStage();
+  applyResponsiveDefaults();
+  applyUiState();
+
   setDot(refs.dotSystem, 'busy');
   refs.systemStatus.textContent = 'BOOTING';
   refs.apiStatus.textContent = 'CHECKING';
@@ -108,13 +122,11 @@ async function init() {
     addClientLog('success', 'MAGI console ready.');
     setDot(refs.dotSystem, 'ready');
     refs.systemStatus.textContent = 'ONLINE';
-    updateRuntimeVisualState('ready');
   } catch (error) {
     console.error(error);
     addClientLog('error', `Initialization failed: ${error.message}`);
     setDot(refs.dotSystem, 'error');
     refs.systemStatus.textContent = 'FAULT';
-    updateRuntimeVisualState('fault');
   }
 
   renderPhaseTimeline();
@@ -122,6 +134,7 @@ async function init() {
   renderTeams();
   renderDecisionMemo();
   renderVotes();
+  renderEventLog();
   renderHud();
 }
 
@@ -132,18 +145,78 @@ function bindUi() {
     await createFreshSession();
     addClientLog('info', 'New session created.');
   });
-  refs.missionInput.addEventListener('input', () => renderHud());
-  refs.modeSelect.addEventListener('change', () => renderHud());
+
+  refs.clearLogButton.addEventListener('click', () => {
+    state.logs = [];
+    renderEventLog();
+  });
+
+  refs.expandTeamsButton.addEventListener('click', () => {
+    state.ui.collapsedTeams.clear();
+    state.ui.touchedTeamCards = true;
+    saveUiState();
+    renderTeams();
+  });
+
+  refs.collapseTeamsButton.addEventListener('click', () => {
+    state.teamOrder.forEach((id) => state.ui.collapsedTeams.add(id));
+    state.ui.touchedTeamCards = true;
+    saveUiState();
+    renderTeams();
+  });
+
+  refs.missionInput.addEventListener('input', debounce(() => renderHud(), 80));
+  refs.modeSelect.addEventListener('change', () => {
+    refs.runtimeModeValue.textContent = refs.modeSelect.value.toUpperCase();
+  });
+
+  document.addEventListener('click', handleDelegatedClick);
+  window.addEventListener('resize', debounce(syncResponsiveLayout, 80));
 }
 
-function setupAdaptiveStage() {
-  const rerender = debounce(() => renderOrbit(), 60);
-  if (typeof ResizeObserver !== 'undefined' && refs.stageCanvas) {
-    state.stageObserver?.disconnect?.();
-    state.stageObserver = new ResizeObserver(() => rerender());
-    state.stageObserver.observe(refs.stageCanvas);
+function observeStage() {
+  if (!('ResizeObserver' in window)) {
+    window.addEventListener('resize', debounce(() => renderOrbit(), 80));
+    return;
   }
-  window.addEventListener('orientationchange', rerender);
+  stageObserver = new ResizeObserver(
+    debounce(() => {
+      syncResponsiveLayout();
+      renderOrbit();
+    }, 60)
+  );
+  stageObserver.observe(refs.stageCanvas);
+}
+
+function handleDelegatedClick(event) {
+  const panelToggle = event.target.closest('[data-panel-toggle]');
+  if (panelToggle) {
+    const panelId = panelToggle.getAttribute('data-panel-toggle');
+    togglePanel(panelId);
+    return;
+  }
+
+  const foldToggle = event.target.closest('[data-fold-toggle]');
+  if (foldToggle) {
+    const foldId = foldToggle.getAttribute('data-fold-toggle');
+    toggleFold(foldId);
+    return;
+  }
+
+  const presetButton = event.target.closest('[data-preset-value]');
+  if (presetButton) {
+    refs.missionInput.value = presetButton.getAttribute('data-preset-value') || '';
+    renderHud();
+    return;
+  }
+
+  const teamToggle = event.target.closest('[data-team-toggle]');
+  if (teamToggle) {
+    const card = teamToggle.closest('[data-team-id]');
+    if (!card) return;
+    const teamId = card.getAttribute('data-team-id');
+    toggleTeamCard(teamId);
+  }
 }
 
 function renderPresets() {
@@ -152,12 +225,9 @@ function renderPresets() {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'preset-chip';
-    button.textContent = text.length > 34 ? `${text.slice(0, 34)}…` : text;
+    button.textContent = text.length > 40 ? `${text.slice(0, 40)}…` : text;
     button.title = text;
-    button.addEventListener('click', () => {
-      refs.missionInput.value = text;
-      renderHud();
-    });
+    button.dataset.presetValue = text;
     refs.presetRow.appendChild(button);
   });
 }
@@ -180,8 +250,6 @@ async function loadConfig() {
     refs.apiStatus.textContent = 'DEMO MODE';
     refs.runtimeModeValue.textContent = 'DEMO';
   }
-
-  renderHud();
 }
 
 function populateModeSelect() {
@@ -201,7 +269,6 @@ function populateModeSelect() {
   });
 }
 
-
 async function createFreshSession() {
   disconnectEventSource();
   resetRuntimeState();
@@ -211,7 +278,6 @@ async function createFreshSession() {
   connectEventSource(payload.sessionId);
   setDot(refs.dotSession, 'busy');
   refs.sessionStatus.textContent = 'STREAMING';
-  renderHud();
 }
 
 function disconnectEventSource() {
@@ -224,6 +290,7 @@ function disconnectEventSource() {
 function resetRuntimeState() {
   state.running = false;
   state.topology = null;
+  state.topologyHealth = null;
   state.teamOrder = [];
   state.teams = new Map();
   state.blackboard = [];
@@ -239,7 +306,8 @@ function resetRuntimeState() {
   refs.majorityVoteDisplay.textContent = 'PENDING';
   refs.majoritySummary.textContent = 'Awaiting topology synthesis.';
   refs.runtimeModeValue.textContent = refs.modeSelect.value?.toUpperCase() || (state.hasApiKey ? 'LIVE' : 'DEMO');
-  updateRuntimeVisualState('ready');
+  refs.topologySummaryValue.textContent = 'PENDING';
+  refs.patternCoverageValue.textContent = '0';
   renderPhaseTimeline();
   renderBlackboard();
   renderTeams();
@@ -258,6 +326,8 @@ function connectEventSource(sessionId) {
     'phase',
     'log',
     'topology',
+    'topology_audit',
+    'subagent_generated',
     'team_spawned',
     'team_layer_complete',
     'agent_spawned',
@@ -274,9 +344,9 @@ function connectEventSource(sessionId) {
   ];
 
   names.forEach((name) => {
-    source.addEventListener(name, (event) => {
+    source.addEventListener(name, (evt) => {
       try {
-        const payload = JSON.parse(event.data);
+        const payload = JSON.parse(evt.data);
         handleEvent(name, payload);
       } catch (error) {
         console.error('Event parse failed', name, error);
@@ -312,14 +382,12 @@ function handleEvent(type, payload) {
         refs.runButton.disabled = true;
         setDot(refs.dotSystem, 'busy');
         refs.systemStatus.textContent = 'EXECUTING';
-        updateRuntimeVisualState('running');
       }
       if (payload.phase === 'complete' && payload.status === 'completed') {
         state.running = false;
         refs.runButton.disabled = false;
         setDot(refs.dotSystem, 'ready');
         refs.systemStatus.textContent = 'READY';
-        updateRuntimeVisualState('ready');
       }
       renderPhaseTimeline();
       break;
@@ -330,10 +398,33 @@ function handleEvent(type, payload) {
     }
     case 'topology': {
       state.topology = payload;
+      state.topologyHealth = payload.health || null;
       initializeTeamsFromTopology(payload);
+      applyTeamDensityStrategy();
       addClientLog('info', `Topology synthesized: ${payload.teams?.length || 0} team(s).`);
       renderTeams();
       renderOrbit();
+      renderHud();
+      break;
+    }
+    case 'topology_audit': {
+      state.topologyHealth = payload;
+      renderHud();
+      break;
+    }
+    case 'subagent_generated': {
+      const team = ensureTeam({ id: payload.teamId });
+      if (payload.agent?.id) {
+        team.agents.set(payload.agent.id, {
+          ...(team.agents.get(payload.agent.id) || {}),
+          ...payload.agent,
+          status: team.agents.get(payload.agent.id)?.status || 'idle',
+        });
+      }
+      addClientLog('info', `Sub-agent generated: ${payload.agent?.codename || payload.agent?.id || 'n/a'} / ${team.name}`);
+      renderTeams();
+      renderOrbit();
+      renderHud();
       break;
     }
     case 'team_spawned': {
@@ -343,6 +434,7 @@ function handleEvent(type, payload) {
       flashTeam(team.id);
       renderTeams();
       renderOrbit();
+      renderHud();
       break;
     }
     case 'agent_spawned': {
@@ -350,10 +442,11 @@ function handleEvent(type, payload) {
       team.agents.set(payload.agent.id, {
         ...(team.agents.get(payload.agent.id) || {}),
         ...payload.agent,
-        status: 'idle',
+        status: team.agents.get(payload.agent.id)?.status || 'idle',
       });
       renderTeams();
       renderOrbit();
+      renderHud();
       break;
     }
     case 'agent_activity': {
@@ -378,7 +471,7 @@ function handleEvent(type, payload) {
       team.agents.set(payload.agentId, agent);
       team.lastContribution = payload.contribution;
       team.contributions.unshift({ agentId: payload.agentId, contribution: payload.contribution, round: payload.round });
-      team.contributions = team.contributions.slice(0, 8);
+      team.contributions = team.contributions.slice(0, 10);
       renderTeams();
       renderOrbit();
       break;
@@ -391,6 +484,7 @@ function handleEvent(type, payload) {
         team.tasks.set(task.id, { ...(team.tasks.get(task.id) || {}), ...task });
       });
       renderTeams();
+      renderHud();
       break;
     }
     case 'task_started': {
@@ -399,6 +493,7 @@ function handleEvent(type, payload) {
         team.tasks.set(payload.task.id, { ...(team.tasks.get(payload.task.id) || {}), ...payload.task, status: 'running' });
       }
       renderTeams();
+      renderHud();
       break;
     }
     case 'task_result': {
@@ -412,6 +507,7 @@ function handleEvent(type, payload) {
       }
       team.lastContribution = payload.contribution;
       renderTeams();
+      renderHud();
       break;
     }
     case 'team_result': {
@@ -428,15 +524,16 @@ function handleEvent(type, payload) {
       }
       renderTeams();
       renderOrbit();
+      renderHud();
       break;
     }
     case 'team_layer_complete': {
-      addClientLog('success', `Execution layer completed: ${payload.teams?.join(', ') || payload.completedTeamIds?.join(', ') || 'n/a'}`);
+      addClientLog('success', `Execution layer completed: ${payload.teams?.join(', ') || 'n/a'}`);
       break;
     }
     case 'blackboard_note': {
       state.blackboard.unshift(payload);
-      state.blackboard = state.blackboard.slice(0, 36);
+      state.blackboard = state.blackboard.slice(0, 40);
       renderBlackboard();
       break;
     }
@@ -459,7 +556,6 @@ function handleEvent(type, payload) {
       refs.runButton.disabled = false;
       setDot(refs.dotSystem, 'ready');
       refs.systemStatus.textContent = 'READY';
-      updateRuntimeVisualState('ready');
       addClientLog('success', `Decision lock complete in ${formatMs(payload.elapsedMs || 0)}.`);
       break;
     }
@@ -468,15 +564,12 @@ function handleEvent(type, payload) {
       refs.runButton.disabled = false;
       setDot(refs.dotSystem, 'error');
       refs.systemStatus.textContent = 'FAULT';
-      updateRuntimeVisualState('fault');
       addServerLog('error', payload.message || 'Unknown error');
       break;
     }
     default:
       break;
   }
-
-  renderHud();
 }
 
 function initializeTeamsFromTopology(topology) {
@@ -501,6 +594,8 @@ function initializeTeamsFromTopology(topology) {
       synthesis: null,
       result: null,
       orbitPosition: null,
+      syntheticTeam: Boolean(team.syntheticTeam),
+      generatedAgentCount: Number(team?.meta?.generatedAgentCount || 0),
     };
     (team.agents || []).forEach((agent) => {
       record.agents.set(agent.id, { ...agent, status: 'idle' });
@@ -535,6 +630,8 @@ function ensureTeam(teamLike) {
       synthesis: null,
       result: null,
       orbitPosition: null,
+      syntheticTeam: Boolean(teamLike.syntheticTeam),
+      generatedAgentCount: Number(teamLike?.meta?.generatedAgentCount || 0),
     });
   } else if (teamLike.name || teamLike.pattern || teamLike.goal || teamLike.deliverable) {
     const current = state.teams.get(id);
@@ -545,6 +642,8 @@ function ensureTeam(teamLike) {
       pattern: teamLike.pattern || current.pattern,
       dependsOn: Array.isArray(teamLike.depends_on) ? teamLike.depends_on.slice() : current.dependsOn,
       maxRounds: teamLike.max_rounds || current.maxRounds,
+      syntheticTeam: Boolean(teamLike.syntheticTeam ?? current.syntheticTeam),
+      generatedAgentCount: Number(teamLike?.meta?.generatedAgentCount || current.generatedAgentCount || 0),
     });
   }
   return state.teams.get(id);
@@ -607,7 +706,6 @@ function renderTeams() {
   refs.teamsGrid.innerHTML = '';
   if (state.teamOrder.length === 0) {
     refs.teamsGrid.innerHTML = '<div class="empty-state">Topology not generated yet.</div>';
-    renderHud();
     return;
   }
 
@@ -616,17 +714,26 @@ function renderTeams() {
     if (!team) return;
     const fragment = refs.teamCardTemplate.content.cloneNode(true);
     const root = fragment.querySelector('.team-card');
+    const collapsed = state.ui.collapsedTeams.has(team.id);
+    root.dataset.teamId = team.id;
     root.classList.add(team.status || 'idle');
-    root.dataset.status = team.status || 'idle';
+    root.classList.toggle('is-collapsed', collapsed);
     fragment.querySelector('.team-card__name').textContent = team.name;
-    fragment.querySelector('.team-card__meta').textContent = `${team.pattern.toUpperCase()} / DEP ${team.dependsOn.length}`;
+    fragment.querySelector('.team-card__meta').textContent = `${team.pattern.toUpperCase()} / DEP ${team.dependsOn.length} / ROUNDS ${team.maxRounds}`;
     fragment.querySelector('.team-card__status').textContent = (team.status || 'idle').toUpperCase();
-    fragment.querySelector('.team-card__goal').textContent = team.goal || team.deliverable || '';
-    fragment.querySelector('.team-card__badge--pattern').textContent = team.pattern.toUpperCase();
-    fragment.querySelector('.team-card__badge--depends').textContent = `DEP ${team.dependsOn.length}`;
-    fragment.querySelector('.team-card__badge--deliverable').textContent = team.deliverable
-      ? truncateText(team.deliverable, 30)
-      : `ROUNDS ${team.maxRounds}`;
+    fragment.querySelector('[data-team-toggle]').textContent = collapsed ? 'OPEN' : 'FOLD';
+
+    const statsEl = fragment.querySelector('.team-card__stats');
+    statsEl.innerHTML = [
+      makeBadge(team.syntheticTeam ? 'SYNTH TEAM' : 'LIVE TEAM', team.syntheticTeam ? 'warn' : 'ok'),
+      makeBadge(`${team.agents.size} AGENT`, 'neutral'),
+      makeBadge(`${team.tasks.size} TASK`, 'neutral'),
+      makeBadge(`${countSyntheticAgents(team)} SYNTH AGENT`, countSyntheticAgents(team) ? 'warn' : 'neutral'),
+    ].join('');
+
+    fragment.querySelector('.team-card__goal').innerHTML = `<strong>Goal</strong> ${escapeHtml(team.goal || '')}`;
+    fragment.querySelector('.team-card__deliverable').innerHTML = `<strong>Deliverable</strong> ${escapeHtml(team.deliverable || '')}`;
+    fragment.querySelector('.team-card__deps').innerHTML = `<strong>Dependencies</strong> ${escapeHtml(team.dependsOn.join(', ') || 'none')}`;
 
     const agentsEl = fragment.querySelector('.team-card__agents');
     const agents = Array.from(team.agents.values());
@@ -635,8 +742,8 @@ function renderTeams() {
     } else {
       agents.forEach((agent) => {
         const pill = document.createElement('span');
-        pill.className = `agent-pill ${agent.status || 'idle'}`;
-        pill.textContent = `${agent.codename || agent.id} / ${agent.status || 'idle'}`;
+        pill.className = `agent-pill ${agent.status || 'idle'}${agent.synthetic ? ' synthetic' : ''}`;
+        pill.textContent = `${agent.codename || agent.id} / ${agent.role || agent.status || 'idle'}`;
         agentsEl.appendChild(pill);
       });
     }
@@ -647,14 +754,16 @@ function renderTeams() {
       tasks.forEach((task) => {
         const pill = document.createElement('span');
         pill.className = `task-pill ${task.status || 'pending'}`;
-        pill.textContent = `${task.title || task.id}`;
+        pill.textContent = `${task.title || task.id}${task.owner_hint ? ` / ${task.owner_hint}` : ''}`;
         tasksEl.appendChild(pill);
       });
     } else if (team.taskSummary) {
       const pill = document.createElement('span');
       pill.className = 'task-pill';
-      pill.textContent = truncateText(team.taskSummary, 46);
+      pill.textContent = team.taskSummary;
       tasksEl.appendChild(pill);
+    } else {
+      tasksEl.innerHTML = '<div class="empty-inline">No tasks yet.</div>';
     }
 
     const resultEl = fragment.querySelector('.team-card__result');
@@ -662,6 +771,7 @@ function renderTeams() {
       resultEl.innerHTML = `
         <div><strong>Summary</strong> ${escapeHtml(team.synthesis.summary || '')}</div>
         <div style="margin-top:6px;"><strong>Readiness</strong> ${escapeHtml((team.synthesis.readiness || 'unknown').toUpperCase())}</div>
+        ${Array.isArray(team.synthesis.conclusions) ? `<div style="margin-top:8px;">${team.synthesis.conclusions.map((item) => `<div>• ${escapeHtml(item)}</div>`).join('')}</div>` : ''}
       `;
     } else if (team.lastContribution?.summary) {
       resultEl.textContent = team.lastContribution.summary;
@@ -671,8 +781,6 @@ function renderTeams() {
 
     refs.teamsGrid.appendChild(fragment);
   });
-
-  renderHud();
 }
 
 function renderOrbit() {
@@ -680,71 +788,54 @@ function renderOrbit() {
   refs.orbitLinks.innerHTML = '';
 
   const teams = state.teamOrder.map((id) => state.teams.get(id)).filter(Boolean);
-  refs.stageCanvas.style.minHeight = `${resolveStageMinHeight(teams.length)}px`;
-
-  if (teams.length === 0) {
-    refs.stageCanvas.dataset.orbitMode = 'ellipse';
-    renderHud();
-    return;
-  }
+  if (teams.length === 0) return;
 
   const rect = refs.stageCanvas.getBoundingClientRect();
   const width = rect.width || 1000;
-  const height = rect.height || 760;
-  const layoutMode = getOrbitLayoutMode(width, height, teams.length);
-  const center = { x: width / 2, y: height / 2 };
-  const nodeWidth = resolveOrbitNodeWidth(width, layoutMode);
-  const positions = buildOrbitPositions({
-    layoutMode,
-    width,
-    height,
-    center,
-    teamCount: teams.length,
-    nodeWidth,
-  });
-
-  refs.stageCanvas.dataset.orbitMode = layoutMode;
+  const height = Math.max(rect.height || 760, 520);
   refs.orbitLinks.setAttribute('viewBox', `0 0 ${width} ${height}`);
 
-  teams.forEach((team, index) => {
-    const position = positions[index] || { x: center.x, y: center.y, angle: 0, width: nodeWidth };
-    team.orbitPosition = position;
+  const mode = getOrbitLayoutMode(width, height, teams.length);
+  refs.stageCanvas.dataset.layoutMode = mode;
+  refs.stageCanvas.style.setProperty('--core-size', `${Math.round(clamp(Math.min(width, height) * (mode === 'stack' ? 0.34 : 0.42), 220, 380))}px`);
+  refs.stageCanvas.style.minHeight = `${computeStageMinHeight(teams.length, width)}px`;
 
+  const center = {
+    x: width / 2,
+    y: mode === 'stack' ? Math.max(170, height * 0.33) : height / 2,
+  };
+
+  const positions = computeOrbitPositions(teams.length, width, height, center, mode);
+  teams.forEach((team, index) => {
+    const point = positions[index];
+    team.orbitPosition = point;
     const fragment = refs.orbitNodeTemplate.content.cloneNode(true);
     const root = fragment.querySelector('.orbit-node');
     root.dataset.teamId = team.id;
     root.classList.add(team.status || 'idle');
-    root.dataset.status = team.status || 'idle';
-    root.dataset.layout = layoutMode;
-    root.style.left = `${position.x}px`;
-    root.style.top = `${position.y}px`;
-    root.style.width = `${position.width || nodeWidth}px`;
-
+    root.style.left = `${point.x}px`;
+    root.style.top = `${point.y}px`;
     fragment.querySelector('.orbit-node__name').textContent = team.name;
     fragment.querySelector('.orbit-node__pattern').textContent = team.pattern.toUpperCase();
-
+    fragment.querySelector('.orbit-node__meta').innerHTML = `
+      <span>${team.agents.size} AG</span>
+      <span>${team.tasks.size} TK</span>
+      <span>${countSyntheticAgents(team)} SYN</span>
+    `;
     const stateEl = fragment.querySelector('.orbit-node__state');
-    if (team.synthesis?.summary) {
-      stateEl.textContent = team.synthesis.summary;
-    } else {
-      stateEl.textContent = team.lastState || team.goal || 'Awaiting execution.';
-    }
-
+    stateEl.textContent = team.synthesis?.summary || team.lastState || team.goal || 'Awaiting execution.';
     const agentsEl = fragment.querySelector('.orbit-node__agents');
     Array.from(team.agents.values())
-      .slice(0, layoutMode === 'stack' ? 4 : 5)
+      .slice(0, 5)
       .forEach((agent) => {
         const pill = document.createElement('span');
-        pill.className = `agent-pill ${agent.status || 'idle'}`;
+        pill.className = `agent-pill ${agent.status || 'idle'}${agent.synthetic ? ' synthetic' : ''}`;
         pill.textContent = agent.codename || agent.id;
         agentsEl.appendChild(pill);
       });
 
-    const metaEl = fragment.querySelector('.orbit-node__meta');
-    metaEl.textContent = `A${team.agents.size} / T${team.tasks.size} / D${team.dependsOn.length}`;
-
     refs.teamOrbit.appendChild(fragment);
-    refs.orbitLinks.appendChild(makeLine(center.x, center.y, position.x, position.y, 'team-link'));
+    refs.orbitLinks.appendChild(makeLine(center.x, center.y, point.x, point.y, 'team-link'));
   });
 
   teams.forEach((team) => {
@@ -756,98 +847,6 @@ function renderOrbit() {
       );
     });
   });
-
-  renderHud();
-}
-
-function resolveStageMinHeight(teamCount) {
-  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1440;
-  if (viewportWidth <= 460) return 1020 + Math.max(0, teamCount - 2) * 136;
-  if (viewportWidth <= 760) return 920 + Math.max(0, teamCount - 2) * 128;
-  if (viewportWidth <= 1120) return 780 + Math.max(0, teamCount - 3) * 96;
-  if (viewportWidth <= 1460) return 700 + Math.max(0, teamCount - 4) * 72;
-  return 780 + Math.max(0, teamCount - 4) * 56;
-}
-
-function getOrbitLayoutMode(width, height, teamCount) {
-  if (width <= 760 || height <= 690) return 'stack';
-  if (width <= 1120 || height <= 760 || (teamCount >= 4 && width <= 1280)) return 'belt';
-  return 'ellipse';
-}
-
-function resolveOrbitNodeWidth(width, layoutMode) {
-  if (layoutMode === 'stack') return Math.min(320, Math.max(236, width - 36));
-  if (layoutMode === 'belt') return Math.min(240, Math.max(198, Math.floor(width * 0.22)));
-  return Math.min(236, Math.max(204, Math.floor(width * 0.18)));
-}
-
-function buildOrbitPositions({ layoutMode, width, height, center, teamCount, nodeWidth }) {
-  if (layoutMode === 'stack') {
-    return buildStackOrbitPositions({ width, height, center, teamCount, nodeWidth });
-  }
-  if (layoutMode === 'belt') {
-    return buildBeltOrbitPositions({ width, height, center, teamCount, nodeWidth });
-  }
-  return buildEllipseOrbitPositions({ width, height, center, teamCount, nodeWidth });
-}
-
-function buildEllipseOrbitPositions({ width, height, center, teamCount, nodeWidth }) {
-  const radiusX = Math.max(nodeWidth * 0.92, Math.min(width * 0.36, width / 2 - nodeWidth * 0.64 - 28));
-  const radiusY = Math.max(170, Math.min(height * 0.29, height / 2 - 132));
-  const angleStep = (Math.PI * 2) / Math.max(1, teamCount);
-  const startAngle = -Math.PI / 2;
-
-  return Array.from({ length: teamCount }, (_, index) => {
-    const angle = startAngle + angleStep * index;
-    return {
-      x: center.x + Math.cos(angle) * radiusX,
-      y: center.y + Math.sin(angle) * radiusY,
-      angle,
-      width: nodeWidth,
-    };
-  });
-}
-
-function buildBeltOrbitPositions({ width, height, center, teamCount, nodeWidth }) {
-  const positions = [];
-  const leftX = Math.max(26 + nodeWidth / 2, center.x - Math.max(nodeWidth * 1.08, width * 0.31));
-  const rightX = Math.min(width - 26 - nodeWidth / 2, center.x + Math.max(nodeWidth * 1.08, width * 0.31));
-  const pairCount = Math.floor(teamCount / 2);
-  const rowCount = pairCount + (teamCount % 2);
-  const topY = 156;
-  const bottomY = Math.max(topY, height - 150);
-  const rowGap = rowCount <= 1 ? 0 : (bottomY - topY) / (rowCount - 1);
-
-  for (let row = 0; row < pairCount; row += 1) {
-    const y = topY + row * rowGap;
-    positions.push({ x: leftX, y, angle: Math.PI, width: nodeWidth });
-    positions.push({ x: rightX, y, angle: 0, width: nodeWidth });
-  }
-
-  if (teamCount % 2 === 1) {
-    positions.push({
-      x: center.x,
-      y: topY + (rowCount - 1) * rowGap,
-      angle: Math.PI / 2,
-      width: Math.min(nodeWidth + 14, width - 44),
-    });
-  }
-
-  return positions;
-}
-
-function buildStackOrbitPositions({ width, height, center, teamCount, nodeWidth }) {
-  const topY = Math.max(Math.round(height * 0.64), Math.round(center.y + 188));
-  const bottomPadding = 124;
-  const usableHeight = Math.max(0, height - topY - bottomPadding);
-  const rowGap = teamCount <= 1 ? 0 : usableHeight / Math.max(1, teamCount - 1);
-
-  return Array.from({ length: teamCount }, (_, index) => ({
-    x: center.x,
-    y: topY + rowGap * index,
-    angle: Math.PI / 2,
-    width: Math.min(nodeWidth, width - 28),
-  }));
 }
 
 function renderVotes() {
@@ -896,6 +895,25 @@ function renderEventLog() {
   });
 }
 
+function renderHud() {
+  const teams = state.teamOrder.map((id) => state.teams.get(id)).filter(Boolean);
+  const agentCount = teams.reduce((sum, team) => sum + team.agents.size, 0);
+  const taskCount = teams.reduce((sum, team) => sum + team.tasks.size, 0);
+  const patterns = [...new Set(teams.map((team) => team.pattern))];
+
+  refs.hudTeamCount.textContent = String(teams.length);
+  refs.hudAgentCount.textContent = String(agentCount);
+  refs.hudTaskCount.textContent = String(taskCount);
+  refs.hudPatternCount.textContent = String(patterns.length);
+  refs.topologySummaryValue.textContent = state.topologyHealth?.summary || (teams.length ? `${teams.length} TEAM(S)` : 'PENDING');
+  refs.patternCoverageValue.textContent = String(patterns.length);
+  refs.missionDigest.textContent =
+    state.topology?.interpretation || compactText(refs.missionInput.value.trim(), 180) || 'Awaiting mission input.';
+  refs.topologyHealthText.textContent =
+    state.topologyHealth?.summary ||
+    (teams.length ? `Topology live // ${teams.length} team(s) // ${agentCount} agent(s)` : 'Topology health pending.');
+}
+
 async function runCycle() {
   if (state.running) return;
   const mission = refs.missionInput.value.trim();
@@ -910,9 +928,7 @@ async function runCycle() {
   refs.runtimeModeValue.textContent = refs.modeSelect.value.toUpperCase();
   setDot(refs.dotSystem, 'busy');
   refs.systemStatus.textContent = 'EXECUTING';
-  updateRuntimeVisualState('running');
   addClientLog('info', 'MAGI cycle started.');
-  renderHud();
 
   try {
     const payload = {
@@ -920,8 +936,8 @@ async function runCycle() {
       mission,
       config: {
         mode: refs.modeSelect.value,
-        maxTeams: Number(refs.maxTeams.value || 3),
-        maxAgentsPerTeam: Number(refs.maxAgents.value || 3),
+        maxTeams: Number(refs.maxTeams.value || 6),
+        maxAgentsPerTeam: Number(refs.maxAgents.value || 4),
         maxRounds: Number(refs.maxRounds.value || 2),
         preferAllPatterns: refs.preferAllPatterns.checked,
         enableWebSearch: refs.enableWebSearch.checked,
@@ -937,9 +953,7 @@ async function runCycle() {
     refs.runButton.disabled = false;
     setDot(refs.dotSystem, 'error');
     refs.systemStatus.textContent = 'FAULT';
-    updateRuntimeVisualState('fault');
     addClientLog('error', `Run failed: ${error.message}`);
-    renderHud();
   }
 }
 
@@ -953,7 +967,7 @@ function addClientLog(level, text) {
 
 function pushLog(entry) {
   state.logs.unshift(entry);
-  state.logs = state.logs.slice(0, 180);
+  state.logs = state.logs.slice(0, 220);
   renderEventLog();
 }
 
@@ -1012,63 +1026,6 @@ function flashTeam(teamId) {
   orbitNode.classList.add('flash');
 }
 
-function renderHud() {
-  const teams = state.teamOrder.map((id) => state.teams.get(id)).filter(Boolean);
-  const teamCount = teams.length;
-  const agentCount = teams.reduce((sum, team) => sum + team.agents.size, 0);
-  const taskCount = teams.reduce((sum, team) => sum + team.tasks.size, 0);
-  const patterns = [...new Set(teams.map((team) => team.pattern).filter(Boolean))];
-  const mission = refs.missionInput.value.trim();
-
-  refs.teamsCount.textContent = String(teamCount).padStart(2, '0');
-  refs.agentsCount.textContent = String(agentCount).padStart(2, '0');
-  refs.tasksCount.textContent = String(taskCount).padStart(2, '0');
-  refs.blackboardCount.textContent = String(state.blackboard.length).padStart(2, '0');
-  refs.missionDigest.textContent = `MISSION // ${truncateText(compactWhitespace(mission) || 'STANDBY', 88)}`;
-  refs.patternCoverage.textContent = `PATTERNS // ${patterns.length ? patterns.map((value) => value.toUpperCase()).join(' • ') : '--'}`;
-  refs.originTag.textContent = `ORIGIN // ${window.location.host.toUpperCase()}`;
-  refs.missionHash.textContent = hashText(mission || 'standby');
-  refs.missionLength.textContent = String(mission.length).padStart(3, '0');
-  refs.stageBanner.textContent = buildStageBanner();
-}
-
-function buildStageBanner() {
-  if (state.finalResult?.report?.majority_vote) {
-    return `DECISION LOCK // ${String(state.finalResult.report.majority_vote).toUpperCase()}`;
-  }
-  if (state.running) {
-    return `PRIMARY ARBITRATION BUS // ${refs.phaseValue.textContent || 'RUNNING'}`;
-  }
-  if (state.sessionId) {
-    return 'PRIMARY ARBITRATION BUS // STANDBY';
-  }
-  return 'BOOTSTRAP BUS // INITIALIZING';
-}
-
-function updateRuntimeVisualState(value) {
-  document.body.dataset.runtime = value;
-}
-
-function hashText(value) {
-  let hash = 0;
-  const source = String(value || '');
-  for (let i = 0; i < source.length; i += 1) {
-    hash = (hash << 5) - hash + source.charCodeAt(i);
-    hash |= 0;
-  }
-  return Math.abs(hash).toString(16).toUpperCase().padStart(8, '0').slice(0, 8);
-}
-
-function truncateText(value, max = 42) {
-  const text = String(value || '');
-  if (text.length <= max) return text;
-  return `${text.slice(0, Math.max(0, max - 1))}…`;
-}
-
-function compactWhitespace(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
-}
-
 function shortId(value) {
   return String(value || '').slice(0, 8).toUpperCase();
 }
@@ -1102,4 +1059,185 @@ function debounce(fn, wait = 80) {
     clearTimeout(timer);
     timer = setTimeout(() => fn(...args), wait);
   };
+}
+
+function togglePanel(panelId) {
+  if (!panelId) return;
+  if (state.ui.collapsedPanels.has(panelId)) {
+    state.ui.collapsedPanels.delete(panelId);
+  } else {
+    state.ui.collapsedPanels.add(panelId);
+  }
+  saveUiState();
+  applyUiState();
+  syncResponsiveLayout();
+  renderOrbit();
+}
+
+function toggleFold(foldId) {
+  if (!foldId) return;
+  if (state.ui.foldedSections.has(foldId)) {
+    state.ui.foldedSections.delete(foldId);
+  } else {
+    state.ui.foldedSections.add(foldId);
+  }
+  saveUiState();
+  applyUiState();
+}
+
+function toggleTeamCard(teamId) {
+  if (!teamId) return;
+  state.ui.touchedTeamCards = true;
+  if (state.ui.collapsedTeams.has(teamId)) {
+    state.ui.collapsedTeams.delete(teamId);
+  } else {
+    state.ui.collapsedTeams.add(teamId);
+  }
+  saveUiState();
+  renderTeams();
+}
+
+function applyUiState() {
+  document.querySelectorAll('[data-panel]').forEach((panel) => {
+    const collapsed = state.ui.collapsedPanels.has(panel.id);
+    panel.classList.toggle('is-collapsed', collapsed);
+  });
+
+  document.querySelectorAll('.fold-block[data-fold]').forEach((block) => {
+    const foldId = block.getAttribute('data-fold');
+    block.classList.toggle('is-collapsed', state.ui.foldedSections.has(foldId));
+  });
+
+  document.querySelectorAll('[data-panel-toggle]').forEach((button) => {
+    const panelId = button.getAttribute('data-panel-toggle');
+    if (!panelId) return;
+    const active = state.ui.collapsedPanels.has(panelId);
+    button.classList.toggle('is-active', active);
+  });
+}
+
+function loadUiState() {
+  try {
+    const raw = localStorage.getItem(UI_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    state.ui.collapsedPanels = new Set(parsed.collapsedPanels || []);
+    state.ui.foldedSections = new Set(parsed.foldedSections || []);
+    state.ui.collapsedTeams = new Set(parsed.collapsedTeams || []);
+    state.ui.touchedTeamCards = Boolean(parsed.touchedTeamCards);
+  } catch (error) {
+    console.warn('Failed to load UI state', error);
+  }
+}
+
+function saveUiState() {
+  try {
+    localStorage.setItem(
+      UI_STORAGE_KEY,
+      JSON.stringify({
+        collapsedPanels: [...state.ui.collapsedPanels],
+        foldedSections: [...state.ui.foldedSections],
+        collapsedTeams: [...state.ui.collapsedTeams],
+        touchedTeamCards: state.ui.touchedTeamCards,
+      })
+    );
+  } catch (error) {
+    console.warn('Failed to save UI state', error);
+  }
+}
+
+function applyResponsiveDefaults() {
+  if (window.innerWidth <= 900) {
+    ['presets', 'blackboard', 'eventsPanel'].forEach((id) => {
+      if (id.endsWith('Panel')) {
+        state.ui.collapsedPanels.add(id);
+      } else {
+        state.ui.foldedSections.add(id);
+      }
+    });
+  }
+  saveUiState();
+}
+
+function syncResponsiveLayout() {
+  const controlsCollapsed = state.ui.collapsedPanels.has('controlsPanel');
+  const telemetryCollapsed = state.ui.collapsedPanels.has('telemetryPanel');
+  const teamsCollapsed = state.ui.collapsedPanels.has('teamsPanel');
+  const eventsCollapsed = state.ui.collapsedPanels.has('eventsPanel');
+
+  const root = document.documentElement;
+  root.style.setProperty('--controls-col', controlsCollapsed && window.innerWidth > 1420 ? '118px' : '350px');
+  root.style.setProperty(
+    '--right-col',
+    telemetryCollapsed && eventsCollapsed && window.innerWidth > 1420 ? '118px' : '350px'
+  );
+
+  refs.layoutRoot.classList.toggle('teams-panel-collapsed', teamsCollapsed);
+}
+
+function applyTeamDensityStrategy() {
+  if (state.ui.touchedTeamCards) return;
+  if (window.innerWidth <= 980 || state.teamOrder.length >= 4) {
+    state.ui.collapsedTeams = new Set(state.teamOrder.slice(2));
+    saveUiState();
+  }
+}
+
+function getOrbitLayoutMode(width, height, teamCount) {
+  if (width < 720) return 'stack';
+  if (width < 1120 || teamCount >= 5) return 'belt';
+  return 'ellipse';
+}
+
+function computeStageMinHeight(teamCount, width) {
+  if (width < 720) return Math.max(760, 420 + teamCount * 140);
+  if (width < 1120) return Math.max(620, 420 + teamCount * 70);
+  return Math.max(560, 420 + teamCount * 40);
+}
+
+function computeOrbitPositions(teamCount, width, height, center, mode) {
+  if (mode === 'stack') {
+    const cols = width < 540 ? 1 : 2;
+    const marginX = cols === 1 ? width / 2 : 130;
+    const gapX = cols === 1 ? 0 : Math.max(220, width - 260);
+    const startY = Math.max(height * 0.56, center.y + 170);
+    return Array.from({ length: teamCount }, (_, index) => {
+      const col = cols === 1 ? 0 : index % cols;
+      const row = cols === 1 ? index : Math.floor(index / cols);
+      const x = cols === 1 ? width / 2 : marginX + col * gapX;
+      const y = startY + row * 130;
+      return { x, y };
+    });
+  }
+
+  const rx = clamp(width * (mode === 'belt' ? 0.36 : 0.38), 200, width / 2 - 110);
+  const ry = clamp(height * (mode === 'belt' ? 0.28 : 0.32), 160, height / 2 - 110);
+  const startAngle = -Math.PI / 2;
+  const step = (Math.PI * 2) / Math.max(teamCount, 1);
+
+  return Array.from({ length: teamCount }, (_, index) => {
+    const angle = startAngle + step * index;
+    return {
+      x: center.x + Math.cos(angle) * rx,
+      y: center.y + Math.sin(angle) * ry,
+    };
+  });
+}
+
+function countSyntheticAgents(team) {
+  return Array.from(team.agents.values()).filter((agent) => agent.synthetic).length;
+}
+
+function compactText(text, max = 120) {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  return normalized.length > max ? `${normalized.slice(0, max)}…` : normalized;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function makeBadge(text, tone = 'neutral') {
+  return `<span class="status-badge ${escapeHtml(tone)}">${escapeHtml(text)}</span>`;
 }

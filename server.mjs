@@ -59,7 +59,7 @@ const TOPOLOGY_SCHEMA = {
       teams: {
         type: 'array',
         minItems: 1,
-        maxItems: 4,
+        maxItems: 6,
         items: {
           type: 'object',
           additionalProperties: false,
@@ -71,7 +71,7 @@ const TOPOLOGY_SCHEMA = {
             depends_on: {
               type: 'array',
               items: { type: 'string' },
-              maxItems: 4,
+              maxItems: 6,
             },
             deliverable: { type: 'string' },
             max_rounds: { type: 'integer', minimum: 1, maximum: 3 },
@@ -280,7 +280,6 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         hasApiKey: Boolean(OPENAI_API_KEY),
         baseUrl: OPENAI_BASE_URL,
-        defaultModels: DEFAULT_MODELS,
         patterns: PATTERNS,
         host: HOST,
         preferredPort: PREFERRED_PORT,
@@ -432,6 +431,7 @@ function formatDisplayHost(host) {
   return host;
 }
 
+
 async function runMagiSession(sessionId, mission, config) {
   const startedAt = Date.now();
   emit(sessionId, 'phase', {
@@ -441,18 +441,38 @@ async function runMagiSession(sessionId, mission, config) {
   });
   emit(sessionId, 'log', {
     level: 'info',
-    text: `Mission accepted. Mode=${config.mode}. Runtime profile initialized.`,
+    text: `Mission accepted. Mode=${config.mode}.`,
   });
 
   let topology;
   if (config.mode === 'demo') {
     topology = buildDemoTopology(mission, config);
-    await sleep(300);
+    await sleep(260);
   } else {
     topology = await designTopology(sessionId, mission, config);
   }
 
   emit(sessionId, 'topology', topology);
+  if (topology?.health) {
+    emit(sessionId, 'topology_audit', topology.health);
+  }
+  for (const team of topology?.teams || []) {
+    if (team.syntheticTeam) {
+      emit(sessionId, 'log', {
+        level: 'info',
+        text: `Synthetic team instantiated: ${team.name} [${team.pattern}].`,
+      });
+    }
+    for (const agent of team.agents || []) {
+      if (agent.synthetic) {
+        emit(sessionId, 'subagent_generated', {
+          teamId: team.id,
+          agent,
+        });
+      }
+    }
+  }
+
   topology.blackboard_seed.forEach((note) => {
     addBlackboardNote(sessionId, {
       source: 'system',
@@ -481,6 +501,7 @@ async function runMagiSession(sessionId, mission, config) {
   });
 }
 
+
 async function designTopology(sessionId, mission, config) {
   emit(sessionId, 'phase', {
     phase: 'planner',
@@ -489,17 +510,19 @@ async function designTopology(sessionId, mission, config) {
   });
 
   const instructions = [
-    'You are the MAGI meta-orchestrator for an EVA-inspired multi-agent system.',
+    'You are the MAGI meta-orchestrator for an EVA-inspired multi-agent runtime.',
     'Design runtime subagents and multiple collaborating teams for the mission.',
     `You may use these collaboration patterns: ${PATTERNS.join(', ')}.`,
     `Create between 2 and ${config.maxTeams} teams.`,
-    `Each team may contain between 1 and ${config.maxAgentsPerTeam} agents.`,
-    'Prefer parallelizable teams when possible.',
-    'Use gpt-5.4 only for critical reasoning, judging, or director roles. Use gpt-5.4-mini for most workers. Use gpt-5.4-nano only for very small support tasks.',
-    'Every team must have a concise deliverable and explicit dependencies.',
-    'The final arbitration method should normally be magi_majority.',
+    `Each team may contain between 1 and ${Math.max(config.maxAgentsPerTeam, 4)} agents.`,
+    'Every team must have a concise deliverable, explicit dependencies, and role separation.',
+    'Teams should be mutually useful rather than redundant.',
+    'Use at least one exploratory team and at least one execution-oriented or verification-oriented team.',
+    'For debate teams, include roles equivalent to pro, con, reviewer, and judge.',
+    'For hierarchy teams, include director/planner, executor, and validator style roles.',
+    'For DAG or swarm teams, include a coordinator or planner role.',
+    'Use gpt-5.4 only for critical reasoning, judgment, or orchestration roles. Use gpt-5.4-mini for most workers. Use gpt-5.4-nano only for very small support tasks.',
     'IDs must be short kebab-case strings.',
-    'Do not create redundant teams. Use pattern coverage only when justified by the mission.',
     'Return only schema-compliant JSON.',
   ].join(' ');
 
@@ -517,26 +540,37 @@ async function designTopology(sessionId, mission, config) {
             `- max rounds per team: ${config.maxRounds}`,
             `- prefer all-pattern coverage: ${config.preferAllPatterns}`,
             `- web search enabled: ${config.enableWebSearch}`,
-            '- build for an EVA/MAGI-style decision system with visible independence, conflict, and final majority arbitration.',
+            '- build for an EVA/MAGI-style decision system with visible independence, conflict, blackboard coordination, and final majority arbitration.',
+            '- produce a topology that can survive partial model failure through role redundancy and clean dependencies.',
           ].join('\n'),
         },
       ],
     },
   ];
 
-  const result = await callStructuredModel({
-    model: config.models.planner,
-    instructions,
-    input,
-    schema: TOPOLOGY_SCHEMA,
-    reasoning: { effort: 'medium' },
-    tools: buildOptionalTools(config, { mission, purpose: 'topology' }),
-  });
+  let rawTopology;
+  try {
+    const result = await callStructuredModel({
+      model: config.models.planner,
+      instructions,
+      input,
+      schema: TOPOLOGY_SCHEMA,
+      reasoning: { effort: 'medium' },
+      tools: buildOptionalTools(config, { mission, purpose: 'topology' }),
+    });
+    rawTopology = result.json;
+  } catch (error) {
+    emit(sessionId, 'log', {
+      level: 'warn',
+      text: `Planner output fallback engaged: ${error?.message || String(error)}`,
+    });
+    rawTopology = buildHeuristicTopologyRaw(mission, config);
+  }
 
-  const topology = normalizeTopology(result.json, mission, config);
+  const topology = normalizeTopology(rawTopology, mission, config);
   emit(sessionId, 'log', {
     level: 'info',
-    text: `Topology generated with ${topology.teams.length} team(s).`,
+    text: `Topology stabilized with ${topology.teams.length} team(s), ${topology.health?.agentCount || 0} agent(s), and ${topology.health?.patternCoverage?.length || 0} collaboration pattern(s).`,
   });
 
   emit(sessionId, 'phase', {
@@ -546,6 +580,7 @@ async function designTopology(sessionId, mission, config) {
   });
   return topology;
 }
+
 
 async function executeTopology(sessionId, mission, topology, config) {
   emit(sessionId, 'phase', {
@@ -557,24 +592,32 @@ async function executeTopology(sessionId, mission, topology, config) {
   const pending = new Map(topology.teams.map((team) => [team.id, team]));
   const completed = new Map();
   const teamResults = [];
+  const order = new Map(topology.teams.map((team, index) => [team.id, index]));
   let guard = 0;
 
-  while (pending.size > 0 && guard < 20) {
+  while (pending.size > 0 && guard < Math.max(20, topology.teams.length * 4)) {
     guard += 1;
-    const ready = [...pending.values()].filter((team) => team.depends_on.every((dep) => completed.has(dep)));
+    const ready = [...pending.values()]
+      .filter((team) => team.depends_on.every((dep) => completed.has(dep)))
+      .sort((a, b) => (order.get(a.id) || 0) - (order.get(b.id) || 0));
+
     if (ready.length === 0) {
-      const leftovers = [...pending.values()].map((team) => team.id);
+      const forced = [...pending.values()].sort((a, b) => (order.get(a.id) || 0) - (order.get(b.id) || 0))[0];
+      if (!forced) break;
+      const previousDeps = forced.depends_on.slice();
+      forced.depends_on = [];
       emit(sessionId, 'log', {
         level: 'warn',
-        text: `Dependency deadlock detected. Forcing execution order on remaining teams: ${leftovers.join(', ')}.`,
+        text: `Dependency deadlock detected. Releasing ${forced.name} from [${previousDeps.join(', ') || 'none'}].`,
       });
-      ready.push(pending.values().next().value);
+      ready.push(forced);
     }
 
     const layerResults = await Promise.all(
       ready.map(async (team) => {
         pending.delete(team.id);
-        const result = await runTeam(sessionId, mission, topology, team, teamResults, config);
+        const upstreamResults = resolveUpstreamTeamResults(team, completed, order);
+        const result = await runTeam(sessionId, mission, topology, team, upstreamResults, config);
         completed.set(team.id, result);
         teamResults.push(result);
         return result;
@@ -592,7 +635,7 @@ async function executeTopology(sessionId, mission, topology, config) {
     status: 'completed',
   });
 
-  return teamResults;
+  return teamResults.sort((a, b) => (order.get(a.team.id) || 0) - (order.get(b.team.id) || 0));
 }
 
 async function runTeam(sessionId, mission, topology, team, priorTeamResults, config) {
@@ -1198,6 +1241,7 @@ async function executeTaskGraph({
   return { tasks, results };
 }
 
+
 async function runMagiArbitration(sessionId, mission, topology, teamResults, config) {
   emit(sessionId, 'phase', {
     phase: 'magi',
@@ -1236,39 +1280,24 @@ async function runMagiArbitration(sessionId, mission, topology, teamResults, con
     )
     .join('\n\n');
 
-  let votes;
-  if (config.mode === 'demo') {
-    votes = [];
-    for (const core of coreProfiles) {
-      emit(sessionId, 'magi_vote', {
-        core: core.id,
-        status: 'running',
-      });
-      await sleep(180 + Math.random() * 140);
-      const payload = {
+  const votes = [];
+  for (const core of coreProfiles) {
+    emit(sessionId, 'magi_vote', {
+      core: core.id,
+      status: 'running',
+    });
+
+    let payload;
+    if (config.mode === 'demo') {
+      await sleep(160 + Math.random() * 120);
+      payload = {
         core: core.id,
         name: core.name,
         axis: core.axis,
         ...buildDemoMagiVote(core, teamResults),
       };
-      emit(sessionId, 'magi_vote', {
-        ...payload,
-        status: 'completed',
-      });
-      addBlackboardNote(sessionId, {
-        source: core.name,
-        type: 'magi-vote',
-        text: `${payload.vote.toUpperCase()}: ${payload.rationale}`,
-      });
-      votes.push(payload);
-    }
-  } else {
-    votes = await Promise.all(
-      coreProfiles.map(async (core) => {
-        emit(sessionId, 'magi_vote', {
-          core: core.id,
-          status: 'running',
-        });
+    } else {
+      try {
         const result = await callStructuredModel({
           model: config.models.judge,
           instructions: `${core.instructions} Return only schema-compliant JSON.`,
@@ -1280,7 +1309,6 @@ async function runMagiArbitration(sessionId, mission, topology, teamResults, con
                   type: 'input_text',
                   text: [
                     `Mission:\n${mission}`,
-                    `Arbitration method: ${topology.final_arbitration.method}`,
                     `Decision criteria: ${topology.final_arbitration.criteria.join(', ')}`,
                     `Compiled team results:\n${teamSummaryText}`,
                     'Vote approve only if the current multi-team result is ready to stand. Vote hold if more iteration is needed. Vote reject if the proposed direction is materially unsound.',
@@ -1293,24 +1321,36 @@ async function runMagiArbitration(sessionId, mission, topology, teamResults, con
           reasoning: { effort: 'medium' },
         });
 
-        const payload = {
+        payload = {
           core: core.id,
           name: core.name,
           axis: core.axis,
           ...result.json,
         };
-        emit(sessionId, 'magi_vote', {
-          ...payload,
-          status: 'completed',
+      } catch (error) {
+        emit(sessionId, 'log', {
+          level: 'warn',
+          text: `${core.name} fallback engaged: ${error?.message || String(error)}`,
         });
-        addBlackboardNote(sessionId, {
-          source: core.name,
-          type: 'magi-vote',
-          text: `${payload.vote.toUpperCase()}: ${payload.rationale}`,
-        });
-        return payload;
-      })
-    );
+        payload = {
+          core: core.id,
+          name: core.name,
+          axis: core.axis,
+          ...buildDemoMagiVote(core, teamResults),
+        };
+      }
+    }
+
+    emit(sessionId, 'magi_vote', {
+      ...payload,
+      status: 'completed',
+    });
+    addBlackboardNote(sessionId, {
+      source: core.name,
+      type: 'magi-vote',
+      text: `${payload.vote.toUpperCase()}: ${payload.rationale}`,
+    });
+    votes.push(payload);
   }
 
   emit(sessionId, 'phase', {
@@ -1320,6 +1360,7 @@ async function runMagiArbitration(sessionId, mission, topology, teamResults, con
   });
   return votes;
 }
+
 
 async function synthesizeFinalReport(sessionId, mission, topology, teamResults, magiVotes, config) {
   const majorityVote = computeMajorityVote(magiVotes);
@@ -1361,16 +1402,24 @@ async function synthesizeFinalReport(sessionId, mission, topology, teamResults, 
     return buildDemoFinalReport(mission, teamResults, magiVotes);
   }
 
-  const report = await callStructuredModel({
-    model: config.models.judge,
-    instructions,
-    input,
-    schema: FINAL_REPORT_SCHEMA,
-    reasoning: { effort: 'medium' },
-  });
-
-  return report.json;
+  try {
+    const report = await callStructuredModel({
+      model: config.models.judge,
+      instructions,
+      input,
+      schema: FINAL_REPORT_SCHEMA,
+      reasoning: { effort: 'medium' },
+    });
+    return report.json;
+  } catch (error) {
+    emit(sessionId, 'log', {
+      level: 'warn',
+      text: `Final report fallback engaged: ${error?.message || String(error)}`,
+    });
+    return buildDemoFinalReport(mission, teamResults, magiVotes);
+  }
 }
+
 
 async function callAgentContribution({
   sessionId,
@@ -1390,16 +1439,25 @@ async function callAgentContribution({
   const instructions = buildAgentInstructions(agent, team, config, extraInstructions);
   const input = buildAgentInput(mission, topology, team, priorTeamResults, sessionId);
 
-  const result = await callStructuredModel({
-    model: agent.model || config.models.worker,
-    instructions,
-    input,
-    schema: CONTRIBUTION_SCHEMA,
-    reasoning: { effort: 'low' },
-    tools: buildOptionalTools(config, { mission, purpose: team.goal, team, agent }),
-  });
-  return result.json;
+  try {
+    const result = await callStructuredModel({
+      model: agent.model || config.models.worker,
+      instructions,
+      input,
+      schema: CONTRIBUTION_SCHEMA,
+      reasoning: { effort: 'low' },
+      tools: buildOptionalTools(config, { mission, purpose: team.goal, team, agent }),
+    });
+    return result.json;
+  } catch (error) {
+    emit(sessionId, 'log', {
+      level: 'warn',
+      text: `Contribution fallback engaged for ${team.name}/${agent.codename}: ${error?.message || String(error)}`,
+    });
+    return buildDemoContribution(agent, team, mission, extraInstructions);
+  }
 }
+
 
 async function callTaskPlanner({
   sessionId,
@@ -1422,17 +1480,26 @@ async function callTaskPlanner({
   ].join('\n\n');
 
   const input = buildAgentInput(mission, topology, team, priorTeamResults, sessionId);
-  const result = await callStructuredModel({
-    model: agent.model || config.models.worker,
-    instructions,
-    input,
-    schema: TASK_GRAPH_SCHEMA,
-    reasoning: { effort: 'low' },
-    tools: buildOptionalTools(config, { mission, purpose: team.goal, team, agent }),
-  });
+  try {
+    const result = await callStructuredModel({
+      model: agent.model || config.models.worker,
+      instructions,
+      input,
+      schema: TASK_GRAPH_SCHEMA,
+      reasoning: { effort: 'low' },
+      tools: buildOptionalTools(config, { mission, purpose: team.goal, team, agent }),
+    });
 
-  return result.json;
+    return result.json;
+  } catch (error) {
+    emit(sessionId, 'log', {
+      level: 'warn',
+      text: `Task planner fallback engaged for ${team.name}/${agent.codename}: ${error?.message || String(error)}`,
+    });
+    return buildDemoTaskGraph(team);
+  }
 }
+
 
 async function synthesizeTeam({
   sessionId,
@@ -1482,14 +1549,22 @@ async function synthesizeTeam({
     },
   ];
 
-  const result = await callStructuredModel({
-    model: config.models.judge,
-    instructions,
-    input,
-    schema: TEAM_SYNTHESIS_SCHEMA,
-    reasoning: { effort: 'medium' },
-  });
-  return result.json;
+  try {
+    const result = await callStructuredModel({
+      model: config.models.judge,
+      instructions,
+      input,
+      schema: TEAM_SYNTHESIS_SCHEMA,
+      reasoning: { effort: 'medium' },
+    });
+    return result.json;
+  } catch (error) {
+    emit(sessionId, 'log', {
+      level: 'warn',
+      text: `Team synthesis fallback engaged for ${team.name}: ${error?.message || String(error)}`,
+    });
+    return buildDemoSynthesis(team, contributions);
+  }
 }
 
 async function callStructuredModel({ model, instructions, input, schema, reasoning, tools }) {
@@ -1634,68 +1709,52 @@ function buildOptionalTools(config, context = {}) {
   return shouldSearch ? [{ type: 'web_search' }] : undefined;
 }
 
+
 function normalizeTopology(raw, mission, config) {
-  if (!raw || typeof raw !== 'object') {
-    return buildDemoTopology(mission, config);
-  }
+  const source = raw && typeof raw === 'object' ? raw : buildHeuristicTopologyRaw(mission, config);
+  return stabilizeTopology(basicNormalizeTopology(source, mission, config), mission, config);
+}
 
-  const teams = Array.isArray(raw.teams) ? raw.teams.slice(0, config.maxTeams) : [];
-  if (teams.length === 0) {
-    return buildDemoTopology(mission, config);
-  }
-
+function basicNormalizeTopology(raw, mission, config) {
+  const teams = Array.isArray(raw?.teams) ? raw.teams.slice(0, config.maxTeams) : [];
   const seenTeamIds = new Set();
   const normalizedTeams = teams.map((team, teamIndex) => {
     const teamId = uniqueSlug(team?.id || team?.name || `team-${teamIndex + 1}`, seenTeamIds);
     const agentsSeen = new Set();
-    const agents = Array.isArray(team?.agents)
-      ? team.agents.slice(0, config.maxAgentsPerTeam).map((agent, agentIndex) => ({
-          id: uniqueSlug(agent?.id || agent?.codename || `${teamId}-agent-${agentIndex + 1}`, agentsSeen),
-          codename: String(agent?.codename || `A-${teamIndex + 1}-${agentIndex + 1}`),
-          role: String(agent?.role || `Specialist ${agentIndex + 1}`),
-          stance: String(agent?.stance || 'neutral'),
-          focus: String(agent?.focus || team?.goal || 'task execution'),
-          model: MODEL_OPTIONS.includes(agent?.model) ? agent.model : config.models.worker,
-          weight: clampNumber(agent?.weight, 0.1, 1, 0.7),
-        }))
-      : [];
-
-    if (agents.length === 0) {
-      agents.push({
-        id: uniqueSlug(`${teamId}-lead`, agentsSeen),
-        codename: `${String(team?.name || 'Team').slice(0, 8).toUpperCase()}-LEAD`,
-        role: 'Lead specialist',
-        stance: 'primary',
-        focus: String(team?.goal || 'general analysis'),
-        model: config.models.worker,
-        weight: 0.8,
-      });
-    }
+    const rawAgents = Array.isArray(team?.agents) ? team.agents.slice(0, Math.max(config.maxAgentsPerTeam, 4)) : [];
+    const agents = rawAgents.map((agent, agentIndex) => ({
+      id: uniqueSlug(agent?.id || agent?.codename || `${teamId}-agent-${agentIndex + 1}`, agentsSeen),
+      codename: sanitizeCodename(agent?.codename || `${teamId}-${agentIndex + 1}`),
+      role: String(agent?.role || ''),
+      stance: String(agent?.stance || ''),
+      focus: String(agent?.focus || ''),
+      model: MODEL_OPTIONS.includes(agent?.model) ? agent.model : config.models.worker,
+      weight: clampNumber(agent?.weight, 0.1, 1, 0.65),
+      synthetic: Boolean(agent?.synthetic),
+    }));
 
     return {
       id: teamId,
       name: String(team?.name || `Team ${teamIndex + 1}`),
       goal: String(team?.goal || mission),
-      pattern: PATTERNS.includes(team?.pattern) ? team.pattern : PATTERNS[teamIndex % PATTERNS.length],
+      pattern: PATTERNS.includes(team?.pattern) ? team.pattern : derivePatternFromIndex(teamIndex),
       depends_on: Array.isArray(team?.depends_on) ? team.depends_on.map((dep) => slugify(dep)).filter(Boolean) : [],
       deliverable: String(team?.deliverable || 'Team recommendation'),
       max_rounds: Math.max(1, Math.min(config.maxRounds, Number(team?.max_rounds) || 1)),
       agents,
+      syntheticTeam: Boolean(team?.syntheticTeam),
+      meta: {
+        generatedAgentCount: 0,
+      },
     };
   });
 
-  const validTeamIds = new Set(normalizedTeams.map((team) => team.id));
-  normalizedTeams.forEach((team, index) => {
-    team.depends_on = team.depends_on.filter((dep) => dep !== team.id && validTeamIds.has(dep));
-    if (index === 0) team.depends_on = [];
-  });
-
-  const blackboardSeed = Array.isArray(raw.blackboard_seed)
+  const blackboardSeed = Array.isArray(raw?.blackboard_seed)
     ? raw.blackboard_seed.slice(0, 8).map((item) => String(item))
     : ['Mission ingested.', 'Topology stabilizing.', 'MAGI arbitration pending.'];
 
   return {
-    interpretation: String(raw.interpretation || 'Mission decomposed into multiple collaborating teams.'),
+    interpretation: String(raw?.interpretation || 'Mission decomposed into multiple collaborating teams.'),
     blackboard_seed: blackboardSeed.length ? blackboardSeed : ['Mission ingested.'],
     teams: normalizedTeams,
     final_arbitration: {
@@ -1706,6 +1765,386 @@ function normalizeTopology(raw, mission, config) {
       criteria: Array.isArray(raw?.final_arbitration?.criteria)
         ? raw.final_arbitration.criteria.slice(0, 6).map((item) => String(item))
         : ['technical validity', 'human impact', 'strategic resilience'],
+    },
+  };
+}
+
+function stabilizeTopology(topology, mission, config) {
+  let teams = topology.teams.slice();
+  const initialTeamCount = teams.length;
+  const targetTeamCount = inferTargetTeamCount(mission, config, teams.length);
+
+  if (teams.length === 0) {
+    teams = basicNormalizeTopology(buildHeuristicTopologyRaw(mission, config), mission, config).teams;
+  }
+
+  teams = ensureTopologyTeamCoverage(teams, mission, config, targetTeamCount);
+  teams = repairTeamDependencies(teams);
+  let generatedAgentsTotal = 0;
+  teams = teams.map((team, index) => {
+    const expanded = expandTeamAgents(team, mission, config, index);
+    generatedAgentsTotal += expanded.generatedAgentCount;
+    return expanded.team;
+  });
+
+  const health = summarizeTopologyHealth(teams, initialTeamCount, generatedAgentsTotal);
+  return {
+    ...topology,
+    teams,
+    health,
+  };
+}
+
+function inferTargetTeamCount(mission, config, currentCount = 0) {
+  let score = 2;
+  const normalizedMission = String(mission || '').toLowerCase();
+  if (normalizedMission.length > 120) score += 1;
+  if (/research|study|analy|compare|benchmark|design|architecture|review|audit|debate|validate|workflow|team|agent|swarm|dag|hierarchy|研究|分析|比較|設計|架構|審查|驗證|工作流|團隊|代理/.test(normalizedMission)) {
+    score += 1;
+  }
+  if (config.preferAllPatterns) {
+    score = Math.max(score, Math.min(config.maxTeams, PATTERNS.length));
+  }
+  return Math.max(2, Math.min(config.maxTeams, Math.max(currentCount, score)));
+}
+
+function ensureTopologyTeamCoverage(teams, mission, config, targetTeamCount) {
+  const result = teams.map((team) => ({ ...team, syntheticTeam: Boolean(team.syntheticTeam), meta: { ...(team.meta || {}) } }));
+  const usedPatterns = new Set(result.map((team) => team.pattern));
+  const priority = getPatternPriorityForMission(mission);
+
+  while (result.length < targetTeamCount && result.length < config.maxTeams) {
+    const pattern = priority.find((item) => !usedPatterns.has(item)) || priority[result.length % priority.length];
+    result.push(buildSupplementalTeam(pattern, mission, result.length, config));
+    usedPatterns.add(pattern);
+  }
+
+  if (result.length < 2) {
+    result.push(buildSupplementalTeam('debate', mission, result.length, config));
+  }
+
+  return result.slice(0, config.maxTeams);
+}
+
+function repairTeamDependencies(teams) {
+  const ordered = teams
+    .map((team, index) => ({ ...team, __order: index }))
+    .sort((a, b) => {
+      const pa = getPatternExecutionPriority(a.pattern);
+      const pb = getPatternExecutionPriority(b.pattern);
+      if (pa !== pb) return pa - pb;
+      return a.__order - b.__order;
+    });
+
+  for (let index = 0; index < ordered.length; index += 1) {
+    const team = ordered[index];
+    const earlier = ordered.slice(0, index);
+    const allowed = new Set(earlier.map((item) => item.id));
+    let deps = Array.isArray(team.depends_on) ? team.depends_on.filter((dep) => allowed.has(dep) && dep !== team.id) : [];
+    if (index === 0) {
+      deps = [];
+    } else if (deps.length === 0) {
+      deps = suggestDependencies(team, earlier);
+    }
+    team.depends_on = Array.from(new Set(deps)).slice(0, 3);
+  }
+
+  return ordered.map(({ __order, ...team }) => team);
+}
+
+function suggestDependencies(team, earlierTeams) {
+  if (!earlierTeams.length) return [];
+  if (team.pattern === 'roundtable' || team.pattern === 'experts') return [];
+  if (team.pattern === 'debate') return earlierTeams.slice(-2).map((item) => item.id);
+  if (team.pattern === 'dag' || team.pattern === 'hierarchy' || team.pattern === 'swarm') {
+    const exploratory = [...earlierTeams].reverse().find((item) => item.pattern === 'roundtable' || item.pattern === 'experts');
+    return [exploratory?.id || earlierTeams[earlierTeams.length - 1].id].filter(Boolean);
+  }
+  return [earlierTeams[earlierTeams.length - 1].id];
+}
+
+function expandTeamAgents(team, mission, config, teamIndex = 0) {
+  const blueprint = getPatternBlueprint(team.pattern, mission);
+  const minimumAgents = getPatternMinimumAgents(team.pattern);
+  const targetCount = Math.max(minimumAgents, Math.min(Math.max(config.maxAgentsPerTeam, minimumAgents), blueprint.length));
+  const agentsSeen = new Set();
+  const agents = [];
+  let generatedAgentCount = 0;
+
+  (team.agents || []).slice(0, targetCount).forEach((agent, index) => {
+    const spec = blueprint[index] || blueprint[blueprint.length - 1] || buildGenericAgentSpec(team.pattern, index);
+    agents.push({
+      id: uniqueSlug(agent?.id || agent?.codename || `${team.id}-agent-${index + 1}`, agentsSeen),
+      codename: sanitizeCodename(agent?.codename || spec.codename || `${team.id}-${index + 1}`),
+      role: String(agent?.role || spec.role),
+      stance: String(agent?.stance || spec.stance),
+      focus: String(agent?.focus || spec.focus || mission),
+      model: MODEL_OPTIONS.includes(agent?.model) ? agent.model : resolveModelTier(spec.modelTier, config),
+      weight: clampNumber(agent?.weight, 0.1, 1, spec.weight ?? 0.65),
+      synthetic: Boolean(agent?.synthetic),
+    });
+  });
+
+  while (agents.length < targetCount) {
+    const index = agents.length;
+    const spec = blueprint[index] || buildGenericAgentSpec(team.pattern, index);
+    agents.push(createSyntheticAgent(team, spec, agentsSeen, config));
+    generatedAgentCount += 1;
+  }
+
+  normalizeAgentWeights(agents);
+
+  return {
+    team: {
+      ...team,
+      agents,
+      meta: {
+        ...(team.meta || {}),
+        generatedAgentCount,
+      },
+    },
+    generatedAgentCount,
+  };
+}
+
+function createSyntheticAgent(team, spec, seen, config) {
+  const rawCodename = spec.codename || spec.role || `${team.pattern}-agent`;
+  return {
+    id: uniqueSlug(`${team.id}-${rawCodename}`, seen),
+    codename: sanitizeCodename(rawCodename),
+    role: spec.role || 'Synthetic specialist',
+    stance: spec.stance || 'neutral',
+    focus: spec.focus || team.goal || 'mission execution',
+    model: resolveModelTier(spec.modelTier, config),
+    weight: clampNumber(spec.weight, 0.1, 1, 0.66),
+    synthetic: true,
+  };
+}
+
+function normalizeAgentWeights(agents) {
+  const total = agents.reduce((sum, agent) => sum + clampNumber(agent.weight, 0.1, 1, 0.65), 0) || 1;
+  agents.forEach((agent, index) => {
+    const normalized = Number((clampNumber(agent.weight, 0.1, 1, 0.65) / total).toFixed(3));
+    agent.weight = normalized > 0 ? normalized : Number((1 / Math.max(agents.length, 1)).toFixed(3));
+    if (!agent.codename) {
+      agent.codename = sanitizeCodename(agent.role || `AGENT-${index + 1}`);
+    }
+  });
+}
+
+function getPatternMinimumAgents(pattern) {
+  return {
+    roundtable: 3,
+    experts: 3,
+    debate: 4,
+    hierarchy: 4,
+    swarm: 4,
+    dag: 4,
+  }[pattern] || 3;
+}
+
+function getPatternBlueprint(pattern, mission) {
+  const missionFocus = compactMissionDescriptor(mission);
+  const blueprints = {
+    roundtable: [
+      { codename: 'ARCHIVIST', role: 'System researcher', stance: 'analytic', focus: `Requirements and precedent for ${missionFocus}`, modelTier: 'worker', weight: 0.72 },
+      { codename: 'ARCHITECT', role: 'Systems architect', stance: 'constructive', focus: `Solution framing for ${missionFocus}`, modelTier: 'planner', weight: 0.76 },
+      { codename: 'CRITIC', role: 'Failure analyst', stance: 'skeptical', focus: `Blind spots and failure modes for ${missionFocus}`, modelTier: 'worker', weight: 0.7 },
+      { codename: 'SYNTH', role: 'Synthesis moderator', stance: 'integrative', focus: `Convergence and option ranking for ${missionFocus}`, modelTier: 'judge', weight: 0.74 },
+    ],
+    experts: [
+      { codename: 'DOMAIN', role: 'Domain expert', stance: 'specialist', focus: `Domain constraints for ${missionFocus}`, modelTier: 'worker', weight: 0.7 },
+      { codename: 'BUILDER', role: 'Implementation expert', stance: 'builder', focus: `Execution design for ${missionFocus}`, modelTier: 'worker', weight: 0.72 },
+      { codename: 'AUDITOR', role: 'Risk expert', stance: 'skeptical', focus: `Risk, quality, and control for ${missionFocus}`, modelTier: 'worker', weight: 0.7 },
+      { codename: 'LEAD', role: 'Lead synthesizer', stance: 'integrative', focus: `Evidence fusion for ${missionFocus}`, modelTier: 'judge', weight: 0.76 },
+    ],
+    debate: [
+      { codename: 'ADVOCATE', role: 'Pro advocate', stance: 'pro', focus: `Best-case argument for ${missionFocus}`, modelTier: 'worker', weight: 0.68 },
+      { codename: 'DISSENTER', role: 'Con advocate', stance: 'con', focus: `Counter-case and attack surface for ${missionFocus}`, modelTier: 'worker', weight: 0.73 },
+      { codename: 'REVIEWER', role: 'Reviewer', stance: 'review', focus: `Evidence audit for ${missionFocus}`, modelTier: 'worker', weight: 0.71 },
+      { codename: 'JUDGE', role: 'Judge', stance: 'judge', focus: `Decision synthesis for ${missionFocus}`, modelTier: 'judge', weight: 0.82 },
+    ],
+    hierarchy: [
+      { codename: 'DIRECTOR', role: 'Director', stance: 'managerial', focus: `Decomposition and command for ${missionFocus}`, modelTier: 'judge', weight: 0.8 },
+      { codename: 'PLANNER', role: 'Workflow planner', stance: 'structural', focus: `Work package planning for ${missionFocus}`, modelTier: 'planner', weight: 0.74 },
+      { codename: 'EXECUTOR', role: 'Executor', stance: 'builder', focus: `Execution details for ${missionFocus}`, modelTier: 'worker', weight: 0.72 },
+      { codename: 'VALIDATOR', role: 'Validator', stance: 'review', focus: `Gate checks for ${missionFocus}`, modelTier: 'worker', weight: 0.71 },
+    ],
+    swarm: [
+      { codename: 'COORD', role: 'Swarm coordinator', stance: 'coordinator', focus: `Blackboard orchestration for ${missionFocus}`, modelTier: 'swarm', weight: 0.77 },
+      { codename: 'SCOUT', role: 'Scout', stance: 'explorer', focus: `Parallel discovery for ${missionFocus}`, modelTier: 'worker', weight: 0.68 },
+      { codename: 'BUILDER', role: 'Builder', stance: 'builder', focus: `Rapid task execution for ${missionFocus}`, modelTier: 'worker', weight: 0.7 },
+      { codename: 'CHECKER', role: 'Validator', stance: 'review', focus: `Convergence and robustness for ${missionFocus}`, modelTier: 'worker', weight: 0.71 },
+    ],
+    dag: [
+      { codename: 'PLANNER', role: 'Workflow planner', stance: 'planner', focus: `Task graph design for ${missionFocus}`, modelTier: 'planner', weight: 0.78 },
+      { codename: 'EXECUTOR', role: 'Executor', stance: 'builder', focus: `Primary execution for ${missionFocus}`, modelTier: 'worker', weight: 0.7 },
+      { codename: 'INTEGRATOR', role: 'Integrator', stance: 'integration', focus: `Artifact integration for ${missionFocus}`, modelTier: 'worker', weight: 0.72 },
+      { codename: 'VERIFIER', role: 'Verifier', stance: 'review', focus: `Dependency correctness for ${missionFocus}`, modelTier: 'worker', weight: 0.72 },
+    ],
+  };
+  return blueprints[pattern] || [buildGenericAgentSpec(pattern, 0), buildGenericAgentSpec(pattern, 1), buildGenericAgentSpec(pattern, 2)];
+}
+
+function buildGenericAgentSpec(pattern, index = 0) {
+  return {
+    codename: `${sanitizeCodename(pattern || 'agent')}-${index + 1}`,
+    role: `Specialist ${index + 1}`,
+    stance: 'neutral',
+    focus: `${pattern || 'general'} execution`,
+    modelTier: 'worker',
+    weight: 0.66,
+  };
+}
+
+function resolveModelTier(tier, config) {
+  if (tier === 'judge') return config.models.judge;
+  if (tier === 'planner') return config.models.planner;
+  if (tier === 'swarm') return config.models.swarm;
+  return config.models.worker;
+}
+
+function getPatternPriorityForMission(mission) {
+  const lower = String(mission || '').toLowerCase();
+  if (/swarm|blackboard|parallel|並行|黑板/.test(lower)) {
+    return ['roundtable', 'swarm', 'dag', 'debate', 'hierarchy', 'experts'];
+  }
+  if (/review|audit|critic|risk|審查|風險|批判/.test(lower)) {
+    return ['experts', 'roundtable', 'dag', 'debate', 'hierarchy', 'swarm'];
+  }
+  if (/implement|build|code|js|frontend|ui|實作|實現|程式|介面/.test(lower)) {
+    return ['roundtable', 'dag', 'hierarchy', 'debate', 'swarm', 'experts'];
+  }
+  return ['roundtable', 'experts', 'dag', 'hierarchy', 'swarm', 'debate'];
+}
+
+function getPatternExecutionPriority(pattern) {
+  return {
+    roundtable: 1,
+    experts: 1,
+    hierarchy: 2,
+    dag: 2,
+    swarm: 2,
+    debate: 3,
+  }[pattern] || 4;
+}
+
+function derivePatternFromIndex(index) {
+  return PATTERNS[index % PATTERNS.length];
+}
+
+function buildSupplementalTeam(pattern, mission, index, config) {
+  const idBase = {
+    roundtable: 'research-council',
+    experts: 'expert-array',
+    dag: 'execution-grid',
+    hierarchy: 'command-lattice',
+    swarm: 'swarm-cell',
+    debate: 'adversarial-jury',
+  }[pattern] || `team-${index + 1}`;
+
+  const name = {
+    roundtable: 'RESEARCH COUNCIL',
+    experts: 'EXPERT ARRAY',
+    dag: 'EXECUTION GRID',
+    hierarchy: 'COMMAND LATTICE',
+    swarm: 'SWARM CELL',
+    debate: 'ADVERSARIAL JURY',
+  }[pattern] || `TEAM ${index + 1}`;
+
+  const goal = {
+    roundtable: `Frame the mission and expand the option space for: ${mission}`,
+    experts: `Produce independent specialist analyses for: ${mission}`,
+    dag: `Convert the strongest path into an executable dependency graph for: ${mission}`,
+    hierarchy: `Decompose delivery ownership and control gates for: ${mission}`,
+    swarm: `Distribute low-coupling tasks through blackboard coordination for: ${mission}`,
+    debate: `Challenge the candidate solution through structured conflict and judgment for: ${mission}`,
+  }[pattern] || mission;
+
+  const deliverable = {
+    roundtable: 'Problem framing, options, and fault lines',
+    experts: 'Independent specialist findings and synthesis inputs',
+    dag: 'Actionable DAG and execution sequence',
+    hierarchy: 'Command plan, work packages, and review gates',
+    swarm: 'Parallelized work queue and convergence report',
+    debate: 'Go/no-go critique with amendments',
+  }[pattern] || 'Team recommendation';
+
+  return {
+    id: idBase,
+    name,
+    goal,
+    pattern,
+    depends_on: [],
+    deliverable,
+    max_rounds: pattern === 'roundtable' ? Math.min(2, config.maxRounds) : 1,
+    agents: [],
+    syntheticTeam: true,
+    meta: {
+      generatedAgentCount: 0,
+    },
+  };
+}
+
+function summarizeTopologyHealth(teams, initialTeamCount, generatedAgentsTotal) {
+  const patternCoverage = [...new Set(teams.map((team) => team.pattern))];
+  const agentCount = teams.reduce((sum, team) => sum + (team.agents?.length || 0), 0);
+  const dependencyCount = teams.reduce((sum, team) => sum + (team.depends_on?.length || 0), 0);
+  const syntheticTeams = teams.filter((team) => team.syntheticTeam).length;
+  return {
+    teamCount: teams.length,
+    agentCount,
+    dependencyCount,
+    syntheticTeams,
+    syntheticAgents: generatedAgentsTotal,
+    patternCoverage,
+    summary: `Topology stable // ${teams.length} team(s) // ${agentCount} agent(s) // ${patternCoverage.length} pattern(s) // ${generatedAgentsTotal} synthetic subagent(s)`,
+    grewFrom: initialTeamCount,
+  };
+}
+
+function resolveUpstreamTeamResults(team, completed, orderMap) {
+  const ids = Array.isArray(team?.depends_on) && team.depends_on.length > 0 ? team.depends_on : [];
+  return ids
+    .map((id) => completed.get(id))
+    .filter(Boolean)
+    .sort((a, b) => (orderMap.get(a.team.id) || 0) - (orderMap.get(b.team.id) || 0));
+}
+
+function sanitizeCodename(value) {
+  const tokens = String(value || '')
+    .replace(/[^a-zA-Z0-9]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  const joined = tokens.join('-').toUpperCase();
+  return (joined || 'AGENT').slice(0, 18);
+}
+
+function compactMissionDescriptor(mission) {
+  const text = String(mission || '').replace(/\s+/g, ' ').trim();
+  if (!text) return 'the mission';
+  return text.length > 72 ? `${text.slice(0, 72)}…` : text;
+}
+
+function buildHeuristicTopologyRaw(mission, config) {
+  const patterns = getPatternPriorityForMission(mission).slice(
+    0,
+    Math.max(2, Math.min(config.maxTeams, config.preferAllPatterns ? PATTERNS.length : 3))
+  );
+  const teams = patterns.map((pattern, index) => buildSupplementalTeam(pattern, mission, index, config));
+  return {
+    interpretation:
+      'The mission is decomposed into exploratory, execution, and adversarial decision cells that can be stabilized into a MAGI-style runtime.',
+    blackboard_seed: [
+      'Mission accepted into MAGI queue.',
+      'Dynamic team generation authorized.',
+      'Shared blackboard initialized for stigmergic coordination.',
+    ],
+    teams,
+    final_arbitration: {
+      method: 'magi_majority',
+      criteria: ['technical validity', 'operator burden', 'strategic resilience'],
     },
   };
 }
@@ -2016,20 +2455,21 @@ function parseJsonText(text) {
   }
 }
 
+
 function normalizeConfig(input) {
-  const mode = !OPENAI_API_KEY ? 'demo' : String(input.mode || 'live').toLowerCase() === 'demo' ? 'demo' : 'live';
+  const mode = String(input.mode || 'live').toLowerCase() === 'demo' ? 'demo' : 'live';
   return {
     mode,
-    maxTeams: clampInt(input.maxTeams, 2, 4, 3),
-    maxAgentsPerTeam: clampInt(input.maxAgentsPerTeam, 2, 4, 3),
+    maxTeams: clampInt(input.maxTeams, 2, 6, 6),
+    maxAgentsPerTeam: clampInt(input.maxAgentsPerTeam, 2, 4, 4),
     maxRounds: clampInt(input.maxRounds, 1, 3, 2),
     preferAllPatterns: Boolean(input.preferAllPatterns ?? true),
     enableWebSearch: Boolean(input.enableWebSearch ?? false),
     models: {
-      planner: sanitizeModel(input?.models?.planner, DEFAULT_MODELS.planner),
-      worker: sanitizeModel(input?.models?.worker, DEFAULT_MODELS.worker),
-      judge: sanitizeModel(input?.models?.judge, DEFAULT_MODELS.judge),
-      swarm: sanitizeModel(input?.models?.swarm, DEFAULT_MODELS.swarm),
+      planner: DEFAULT_MODELS.planner,
+      worker: DEFAULT_MODELS.worker,
+      judge: DEFAULT_MODELS.judge,
+      swarm: DEFAULT_MODELS.swarm,
     },
   };
 }
@@ -2108,145 +2548,12 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+
 function buildDemoTopology(mission, config) {
-  return {
-    interpretation:
-      'The mission is decomposed into multiple cooperating teams: independent research, adversarial review, orchestrated execution, and final MAGI arbitration.',
-    blackboard_seed: [
-      'Mission accepted into MAGI queue.',
-      'Subagent generation authorized.',
-      'Shared blackboard initialized for stigmergic coordination.',
-    ],
-    teams: [
-      {
-        id: 'research-council',
-        name: 'RESEARCH COUNCIL',
-        goal: `Frame the mission and surface multiple technical options for: ${mission}`,
-        pattern: 'roundtable',
-        depends_on: [],
-        deliverable: 'Multi-perspective framing and option space',
-        max_rounds: Math.min(2, config.maxRounds),
-        agents: [
-          {
-            id: 'research-archivist',
-            codename: 'ARCHIVIST',
-            role: 'System researcher',
-            stance: 'analytic',
-            focus: 'Requirements and precedent',
-            model: config.models.worker,
-            weight: 0.74,
-          },
-          {
-            id: 'research-architect',
-            codename: 'ARCHITECT',
-            role: 'Systems architect',
-            stance: 'constructive',
-            focus: 'Topology and interfaces',
-            model: config.models.worker,
-            weight: 0.78,
-          },
-          {
-            id: 'research-critic',
-            codename: 'CRITIC',
-            role: 'Failure analyst',
-            stance: 'skeptical',
-            focus: 'Risks and blind spots',
-            model: config.models.worker,
-            weight: 0.7,
-          },
-        ],
-      },
-      {
-        id: 'execution-grid',
-        name: 'EXECUTION GRID',
-        goal: 'Convert the strongest path into an executable workflow with distributed task ownership.',
-        pattern: 'dag',
-        depends_on: ['research-council'],
-        deliverable: 'Actionable DAG and implementation sequence',
-        max_rounds: 1,
-        agents: [
-          {
-            id: 'grid-director',
-            codename: 'DIRECTOR',
-            role: 'Workflow planner',
-            stance: 'managerial',
-            focus: 'Task graph generation',
-            model: config.models.worker,
-            weight: 0.81,
-          },
-          {
-            id: 'grid-builder',
-            codename: 'BUILDER',
-            role: 'Implementation specialist',
-            stance: 'builder',
-            focus: 'Execution detail',
-            model: config.models.worker,
-            weight: 0.73,
-          },
-          {
-            id: 'grid-validator',
-            codename: 'VALIDATOR',
-            role: 'Validation specialist',
-            stance: 'review',
-            focus: 'Dependency correctness',
-            model: config.models.worker,
-            weight: 0.72,
-          },
-        ],
-      },
-      {
-        id: 'adversarial-jury',
-        name: 'ADVERSARIAL JURY',
-        goal: 'Challenge the candidate solution through structured conflict and judgment.',
-        pattern: 'debate',
-        depends_on: ['research-council', 'execution-grid'],
-        deliverable: 'Go/no-go critique with amendments',
-        max_rounds: 1,
-        agents: [
-          {
-            id: 'jury-pro',
-            codename: 'ADVOCATE',
-            role: 'Pro advocate',
-            stance: 'pro',
-            focus: 'Best-case justification',
-            model: config.models.worker,
-            weight: 0.69,
-          },
-          {
-            id: 'jury-con',
-            codename: 'DISSENTER',
-            role: 'Con advocate',
-            stance: 'con',
-            focus: 'Adversarial critique',
-            model: config.models.worker,
-            weight: 0.76,
-          },
-          {
-            id: 'jury-review',
-            codename: 'AUDITOR',
-            role: 'Reviewer',
-            stance: 'review',
-            focus: 'Evidence quality',
-            model: config.models.worker,
-            weight: 0.73,
-          },
-          {
-            id: 'jury-judge',
-            codename: 'JUDGE',
-            role: 'Judge',
-            stance: 'judge',
-            focus: 'Decision synthesis',
-            model: config.models.judge,
-            weight: 0.88,
-          },
-        ],
-      },
-    ].slice(0, config.maxTeams),
-    final_arbitration: {
-      method: 'magi_majority',
-      criteria: ['technical validity', 'operator burden', 'strategic resilience'],
-    },
-  };
+  return normalizeTopology(buildHeuristicTopologyRaw(mission, config), mission, {
+    ...config,
+    preferAllPatterns: true,
+  });
 }
 
 function buildDemoMagiVote(core, teamResults) {

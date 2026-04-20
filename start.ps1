@@ -1,10 +1,8 @@
 param(
-  [int]$Port = 3000,
-  [string]$HostAddr = '127.0.0.1'
+  [int]$Port = 3000
 )
 
-$env:PORT = $Port
-$env:HOST = $HostAddr
-
-Write-Host "Starting MAGI runtime... preferred port=$Port host=$HostAddr" -ForegroundColor Cyan
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $root
+$env:PORT = "$Port"
 node .\server.mjs
