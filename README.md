@@ -52,6 +52,9 @@ node .\server.mjs
 
 ## 環境變數
 
+模型配置已從前端介面移除，改由 `.env` / 環境變數控制。
+
+
 ```bash
 OPENAI_API_KEY=your_key_here
 OPENAI_BASE_URL=https://api.openai.com/v1
@@ -65,7 +68,7 @@ MAGI_SWARM_MODEL=gpt-5.4-mini
 
 ## 介面說明
 
-- 左側：任務輸入、模型與執行配置、mission digest
+- 左側：任務輸入、執行配置、mission digest
 - 中央：MAGI 決策室、動態團隊軌道圖、HUD 統計、狀態 banner
 - 右側：phase timeline、shared blackboard、decision memo
 - 下方：team cards 與 event log

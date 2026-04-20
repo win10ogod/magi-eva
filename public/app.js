@@ -32,6 +32,7 @@ const state = {
   },
   finalResult: null,
   apiBase: '',
+  stageObserver: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -52,10 +53,6 @@ const refs = {
   missionHash: $('#missionHash'),
   missionLength: $('#missionLength'),
   modeSelect: $('#modeSelect'),
-  plannerModel: $('#plannerModel'),
-  workerModel: $('#workerModel'),
-  judgeModel: $('#judgeModel'),
-  swarmModel: $('#swarmModel'),
   maxTeams: $('#maxTeams'),
   maxAgents: $('#maxAgents'),
   maxRounds: $('#maxRounds'),
@@ -97,6 +94,7 @@ window.addEventListener('resize', debounce(() => renderOrbit(), 80));
 async function init() {
   startClock();
   bindUi();
+  setupAdaptiveStage();
   renderPresets();
   updateRuntimeVisualState('booting');
   setDot(refs.dotSystem, 'busy');
@@ -138,6 +136,16 @@ function bindUi() {
   refs.modeSelect.addEventListener('change', () => renderHud());
 }
 
+function setupAdaptiveStage() {
+  const rerender = debounce(() => renderOrbit(), 60);
+  if (typeof ResizeObserver !== 'undefined' && refs.stageCanvas) {
+    state.stageObserver?.disconnect?.();
+    state.stageObserver = new ResizeObserver(() => rerender());
+    state.stageObserver.observe(refs.stageCanvas);
+  }
+  window.addEventListener('orientationchange', rerender);
+}
+
 function renderPresets() {
   refs.presetRow.innerHTML = '';
   PRESETS.forEach((text) => {
@@ -148,6 +156,7 @@ function renderPresets() {
     button.title = text;
     button.addEventListener('click', () => {
       refs.missionInput.value = text;
+      renderHud();
     });
     refs.presetRow.appendChild(button);
   });
@@ -161,10 +170,6 @@ async function loadConfig() {
   refs.apiBaseValue.textContent = payload.baseUrl;
 
   populateModeSelect();
-  populateModelSelect(refs.plannerModel, payload.defaultModels?.planner || 'gpt-5.4');
-  populateModelSelect(refs.workerModel, payload.defaultModels?.worker || 'gpt-5.4-mini');
-  populateModelSelect(refs.judgeModel, payload.defaultModels?.judge || 'gpt-5.4');
-  populateModelSelect(refs.swarmModel, payload.defaultModels?.swarm || 'gpt-5.4-mini');
 
   if (state.hasApiKey) {
     setDot(refs.dotApi, 'ready');
@@ -196,17 +201,6 @@ function populateModeSelect() {
   });
 }
 
-function populateModelSelect(select, selected) {
-  const models = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano'];
-  select.innerHTML = '';
-  models.forEach((model) => {
-    const option = document.createElement('option');
-    option.value = model;
-    option.textContent = model;
-    if (model === selected) option.selected = true;
-    select.appendChild(option);
-  });
-}
 
 async function createFreshSession() {
   disconnectEventSource();
@@ -686,32 +680,46 @@ function renderOrbit() {
   refs.orbitLinks.innerHTML = '';
 
   const teams = state.teamOrder.map((id) => state.teams.get(id)).filter(Boolean);
-  if (teams.length === 0) return;
+  refs.stageCanvas.style.minHeight = `${resolveStageMinHeight(teams.length)}px`;
+
+  if (teams.length === 0) {
+    refs.stageCanvas.dataset.orbitMode = 'ellipse';
+    renderHud();
+    return;
+  }
 
   const rect = refs.stageCanvas.getBoundingClientRect();
   const width = rect.width || 1000;
   const height = rect.height || 760;
+  const layoutMode = getOrbitLayoutMode(width, height, teams.length);
+  const center = { x: width / 2, y: height / 2 };
+  const nodeWidth = resolveOrbitNodeWidth(width, layoutMode);
+  const positions = buildOrbitPositions({
+    layoutMode,
+    width,
+    height,
+    center,
+    teamCount: teams.length,
+    nodeWidth,
+  });
+
+  refs.stageCanvas.dataset.orbitMode = layoutMode;
   refs.orbitLinks.setAttribute('viewBox', `0 0 ${width} ${height}`);
 
-  const center = { x: width / 2, y: height / 2 };
-  const radiusX = Math.max(220, Math.min(width * 0.36, width / 2 - 150));
-  const radiusY = Math.max(170, Math.min(height * 0.3, height / 2 - 126));
-  const angleStep = (Math.PI * 2) / teams.length;
-  const startAngle = -Math.PI / 2;
-
   teams.forEach((team, index) => {
-    const angle = startAngle + angleStep * index;
-    const x = center.x + Math.cos(angle) * radiusX;
-    const y = center.y + Math.sin(angle) * radiusY;
-    team.orbitPosition = { x, y, angle };
+    const position = positions[index] || { x: center.x, y: center.y, angle: 0, width: nodeWidth };
+    team.orbitPosition = position;
 
     const fragment = refs.orbitNodeTemplate.content.cloneNode(true);
     const root = fragment.querySelector('.orbit-node');
     root.dataset.teamId = team.id;
     root.classList.add(team.status || 'idle');
     root.dataset.status = team.status || 'idle';
-    root.style.left = `${x}px`;
-    root.style.top = `${y}px`;
+    root.dataset.layout = layoutMode;
+    root.style.left = `${position.x}px`;
+    root.style.top = `${position.y}px`;
+    root.style.width = `${position.width || nodeWidth}px`;
+
     fragment.querySelector('.orbit-node__name').textContent = team.name;
     fragment.querySelector('.orbit-node__pattern').textContent = team.pattern.toUpperCase();
 
@@ -724,7 +732,7 @@ function renderOrbit() {
 
     const agentsEl = fragment.querySelector('.orbit-node__agents');
     Array.from(team.agents.values())
-      .slice(0, 5)
+      .slice(0, layoutMode === 'stack' ? 4 : 5)
       .forEach((agent) => {
         const pill = document.createElement('span');
         pill.className = `agent-pill ${agent.status || 'idle'}`;
@@ -736,8 +744,7 @@ function renderOrbit() {
     metaEl.textContent = `A${team.agents.size} / T${team.tasks.size} / D${team.dependsOn.length}`;
 
     refs.teamOrbit.appendChild(fragment);
-
-    refs.orbitLinks.appendChild(makeLine(center.x, center.y, x, y, 'team-link'));
+    refs.orbitLinks.appendChild(makeLine(center.x, center.y, position.x, position.y, 'team-link'));
   });
 
   teams.forEach((team) => {
@@ -751,6 +758,96 @@ function renderOrbit() {
   });
 
   renderHud();
+}
+
+function resolveStageMinHeight(teamCount) {
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1440;
+  if (viewportWidth <= 460) return 1020 + Math.max(0, teamCount - 2) * 136;
+  if (viewportWidth <= 760) return 920 + Math.max(0, teamCount - 2) * 128;
+  if (viewportWidth <= 1120) return 780 + Math.max(0, teamCount - 3) * 96;
+  if (viewportWidth <= 1460) return 700 + Math.max(0, teamCount - 4) * 72;
+  return 780 + Math.max(0, teamCount - 4) * 56;
+}
+
+function getOrbitLayoutMode(width, height, teamCount) {
+  if (width <= 760 || height <= 690) return 'stack';
+  if (width <= 1120 || height <= 760 || (teamCount >= 4 && width <= 1280)) return 'belt';
+  return 'ellipse';
+}
+
+function resolveOrbitNodeWidth(width, layoutMode) {
+  if (layoutMode === 'stack') return Math.min(320, Math.max(236, width - 36));
+  if (layoutMode === 'belt') return Math.min(240, Math.max(198, Math.floor(width * 0.22)));
+  return Math.min(236, Math.max(204, Math.floor(width * 0.18)));
+}
+
+function buildOrbitPositions({ layoutMode, width, height, center, teamCount, nodeWidth }) {
+  if (layoutMode === 'stack') {
+    return buildStackOrbitPositions({ width, height, center, teamCount, nodeWidth });
+  }
+  if (layoutMode === 'belt') {
+    return buildBeltOrbitPositions({ width, height, center, teamCount, nodeWidth });
+  }
+  return buildEllipseOrbitPositions({ width, height, center, teamCount, nodeWidth });
+}
+
+function buildEllipseOrbitPositions({ width, height, center, teamCount, nodeWidth }) {
+  const radiusX = Math.max(nodeWidth * 0.92, Math.min(width * 0.36, width / 2 - nodeWidth * 0.64 - 28));
+  const radiusY = Math.max(170, Math.min(height * 0.29, height / 2 - 132));
+  const angleStep = (Math.PI * 2) / Math.max(1, teamCount);
+  const startAngle = -Math.PI / 2;
+
+  return Array.from({ length: teamCount }, (_, index) => {
+    const angle = startAngle + angleStep * index;
+    return {
+      x: center.x + Math.cos(angle) * radiusX,
+      y: center.y + Math.sin(angle) * radiusY,
+      angle,
+      width: nodeWidth,
+    };
+  });
+}
+
+function buildBeltOrbitPositions({ width, height, center, teamCount, nodeWidth }) {
+  const positions = [];
+  const leftX = Math.max(26 + nodeWidth / 2, center.x - Math.max(nodeWidth * 1.08, width * 0.31));
+  const rightX = Math.min(width - 26 - nodeWidth / 2, center.x + Math.max(nodeWidth * 1.08, width * 0.31));
+  const pairCount = Math.floor(teamCount / 2);
+  const rowCount = pairCount + (teamCount % 2);
+  const topY = 156;
+  const bottomY = Math.max(topY, height - 150);
+  const rowGap = rowCount <= 1 ? 0 : (bottomY - topY) / (rowCount - 1);
+
+  for (let row = 0; row < pairCount; row += 1) {
+    const y = topY + row * rowGap;
+    positions.push({ x: leftX, y, angle: Math.PI, width: nodeWidth });
+    positions.push({ x: rightX, y, angle: 0, width: nodeWidth });
+  }
+
+  if (teamCount % 2 === 1) {
+    positions.push({
+      x: center.x,
+      y: topY + (rowCount - 1) * rowGap,
+      angle: Math.PI / 2,
+      width: Math.min(nodeWidth + 14, width - 44),
+    });
+  }
+
+  return positions;
+}
+
+function buildStackOrbitPositions({ width, height, center, teamCount, nodeWidth }) {
+  const topY = Math.max(Math.round(height * 0.64), Math.round(center.y + 188));
+  const bottomPadding = 124;
+  const usableHeight = Math.max(0, height - topY - bottomPadding);
+  const rowGap = teamCount <= 1 ? 0 : usableHeight / Math.max(1, teamCount - 1);
+
+  return Array.from({ length: teamCount }, (_, index) => ({
+    x: center.x,
+    y: topY + rowGap * index,
+    angle: Math.PI / 2,
+    width: Math.min(nodeWidth, width - 28),
+  }));
 }
 
 function renderVotes() {
@@ -828,12 +925,6 @@ async function runCycle() {
         maxRounds: Number(refs.maxRounds.value || 2),
         preferAllPatterns: refs.preferAllPatterns.checked,
         enableWebSearch: refs.enableWebSearch.checked,
-        models: {
-          planner: refs.plannerModel.value,
-          worker: refs.workerModel.value,
-          judge: refs.judgeModel.value,
-          swarm: refs.swarmModel.value,
-        },
       },
     };
     await api('/api/run', {

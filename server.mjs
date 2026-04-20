@@ -441,7 +441,7 @@ async function runMagiSession(sessionId, mission, config) {
   });
   emit(sessionId, 'log', {
     level: 'info',
-    text: `Mission accepted. Mode=${config.mode}. Planner=${config.models.planner}, Worker=${config.models.worker}, Judge=${config.models.judge}.`,
+    text: `Mission accepted. Mode=${config.mode}. Runtime profile initialized.`,
   });
 
   let topology;

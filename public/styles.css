@@ -1666,3 +1666,258 @@ body[data-runtime='fault'] .panel {
     min-height: 118px;
   }
 }
+
+
+/* Adaptive layout refinements */
+.layout,
+.topbar,
+.controls,
+.stage,
+.telemetry,
+.teams,
+.events,
+.team-card,
+.blackboard-list,
+.event-log,
+.decision-memo,
+.orbit-node,
+.mission-input {
+  min-width: 0;
+}
+
+.control-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.status-chip {
+  min-width: min(100%, 128px);
+}
+
+.teams-grid {
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.team-card__head,
+.team-card__badges,
+.orbit-node__header,
+.status-strip {
+  flex-wrap: wrap;
+}
+
+.orbit-node__state,
+.team-card__goal,
+.team-card__result,
+.decision-memo,
+.blackboard-entry__text,
+.log-line {
+  overflow-wrap: anywhere;
+}
+
+.stage-canvas[data-orbit-mode='belt'] .orbit-node {
+  width: min(240px, calc(50% - 44px));
+}
+
+.stage-canvas[data-orbit-mode='stack'] .stage-status-banner {
+  left: 12px;
+  right: 12px;
+  top: 72px;
+  max-width: none;
+  white-space: normal;
+  line-height: 1.45;
+}
+
+.stage-canvas[data-orbit-mode='stack'] .stage-overlay--top,
+.stage-canvas[data-orbit-mode='stack'] .stage-overlay--bottom {
+  left: 12px;
+  right: 12px;
+}
+
+.stage-canvas[data-orbit-mode='stack'] .stage-sweep {
+  top: 42%;
+  width: min(96%, 640px);
+}
+
+.stage-canvas[data-orbit-mode='stack'] .stage-radar {
+  top: 42%;
+  width: min(92%, 520px);
+}
+
+.stage-canvas[data-orbit-mode='stack'] .orbit-node {
+  width: min(320px, calc(100% - 32px));
+}
+
+.stage-canvas[data-orbit-mode='stack'] .orbit-node__state {
+  min-height: 0;
+}
+
+@media (max-width: 980px) {
+  .hud-stat {
+    min-width: calc(50% - 4px);
+    flex: 1 1 calc(50% - 4px);
+  }
+
+  .topbar__right {
+    text-align: left;
+  }
+}
+
+@media (max-width: 720px) {
+  .app-shell {
+    padding: 10px;
+  }
+
+  .panel {
+    backdrop-filter: blur(8px);
+  }
+
+  .mission-input {
+    min-height: 152px;
+  }
+
+  .stage-canvas {
+    min-height: 920px;
+  }
+
+  .magi-core {
+    width: 272px;
+    height: 272px;
+    top: 40%;
+  }
+
+  .core-labels {
+    width: 196px;
+  }
+
+  .core-majority {
+    font-size: 28px;
+  }
+
+  .core-node {
+    width: 170px;
+    min-height: 84px;
+    padding: 9px 10px;
+  }
+
+  .core-node--melchior {
+    top: 96px;
+  }
+
+  .core-node--balthasar {
+    left: 12px;
+    top: calc(50% + 92px);
+  }
+
+  .core-node--casper {
+    left: calc(50% + 8px);
+    top: calc(50% + 92px);
+  }
+
+  .orbit-node {
+    min-height: 112px;
+  }
+}
+
+@media (max-width: 560px) {
+  .topbar,
+  .controls,
+  .stage,
+  .telemetry,
+  .teams,
+  .events {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+
+  .status-chip {
+    width: 100%;
+  }
+
+  .button-row,
+  .control-grid,
+  .teams-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .hud-ribbon {
+    flex-basis: 100%;
+  }
+
+  .stage-canvas {
+    min-height: 1020px;
+  }
+
+  .stage-status-banner {
+    font-size: 10px;
+  }
+
+  .magi-core {
+    width: 228px;
+    height: 228px;
+    top: 36%;
+  }
+
+  .core-labels {
+    width: 172px;
+  }
+
+  .core-center-tag {
+    font-size: 11px;
+  }
+
+  .core-majority {
+    font-size: 23px;
+  }
+
+  .core-summary {
+    font-size: 12px;
+  }
+
+  .core-node {
+    width: calc(50% - 18px);
+    min-height: 82px;
+  }
+
+  .core-node__title {
+    font-size: 11px;
+  }
+
+  .core-node__axis {
+    font-size: 11px;
+  }
+
+  .core-node__vote {
+    font-size: 12px;
+  }
+}
+
+@media (max-width: 420px) {
+  .app-shell {
+    padding: 8px;
+  }
+
+  .system-mark h1 {
+    font-size: 18px;
+    letter-spacing: 0.12em;
+  }
+
+  .mission-input {
+    min-height: 136px;
+  }
+
+  .stage-canvas {
+    min-height: 1080px;
+  }
+
+  .magi-core {
+    width: 206px;
+    height: 206px;
+  }
+
+  .core-node {
+    width: calc(50% - 16px);
+  }
+
+  .orbit-node {
+    padding: 10px;
+  }
+}
