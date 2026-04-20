@@ -10,6 +10,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const ENV_PATH = path.join(__dirname, '.env');
+const DATA_DIR = path.join(__dirname, 'data');
+const SESSION_ARCHIVE_DIR = path.join(DATA_DIR, 'sessions');
+const MAX_EVENT_HISTORY = 1800;
+const MAX_TRANSCRIPT_ENTRIES = 6000;
+const MAX_MODEL_CALLS = 2400;
 
 loadEnv(ENV_PATH);
 
@@ -42,6 +47,7 @@ const MIME = {
 };
 
 const sessions = new Map();
+const persistTimers = new Map();
 
 const TOPOLOGY_SCHEMA = {
   name: 'magi_topology',
@@ -328,6 +334,15 @@ const server = http.createServer(async (req, res) => {
       session.running = true;
       session.state.mission = mission;
       session.state.config = config;
+      updateSessionArchiveMeta(session.id, { mission, config });
+      recordTranscript(session.id, {
+        channel: 'system',
+        kind: 'mission_received',
+        direction: 'event',
+        title: 'Mission received',
+        text: mission,
+        data: { mode: config.mode, maxTeams: config.maxTeams, maxAgentsPerTeam: config.maxAgentsPerTeam, maxRounds: config.maxRounds },
+      });
 
       void runMagiSession(session.id, mission, config)
         .catch((error) => {
@@ -339,6 +354,7 @@ const server = http.createServer(async (req, res) => {
         .finally(() => {
           const active = getSessionOrNull(session.id);
           if (active) active.running = false;
+          scheduleSessionPersist(session.id, 40);
         });
 
       return sendJson(res, 202, {
@@ -346,6 +362,25 @@ const server = http.createServer(async (req, res) => {
         sessionId: session.id,
         mode: config.mode,
       });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/archive') {
+      const sessionId = url.searchParams.get('session');
+      const session = getSessionOrNull(sessionId);
+      if (!session) {
+        return sendJson(res, 404, { ok: false, error: 'Unknown session.' });
+      }
+      return sendJson(res, 200, buildSessionArchiveSummary(session));
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/export') {
+      const sessionId = url.searchParams.get('session');
+      const format = String(url.searchParams.get('format') || 'json').toLowerCase();
+      const session = getSessionOrNull(sessionId);
+      if (!session) {
+        return sendJson(res, 404, { ok: false, error: 'Unknown session.' });
+      }
+      return sendSessionArchiveExport(res, session, format);
     }
 
     if (req.method === 'GET') {
@@ -365,6 +400,7 @@ void startServer();
 
 async function startServer() {
   try {
+    await ensureRuntimeDirs();
     const port = await findAvailablePort(PREFERRED_PORT, HOST, 24);
     ACTIVE_PORT = port;
     await new Promise((resolve, reject) => {
@@ -434,6 +470,7 @@ function formatDisplayHost(host) {
 
 async function runMagiSession(sessionId, mission, config) {
   const startedAt = Date.now();
+  updateSessionArchiveMeta(sessionId, { mission, config });
   emit(sessionId, 'phase', {
     phase: 'boot',
     label: 'SYSTEM BOOT',
@@ -447,16 +484,39 @@ async function runMagiSession(sessionId, mission, config) {
   let topology;
   if (config.mode === 'demo') {
     topology = buildDemoTopology(mission, config);
+    recordTranscript(sessionId, {
+      channel: 'planner',
+      kind: 'topology_response',
+      direction: 'response',
+      title: 'Topology planner / demo topology',
+      text: normalizeRecordText(topology),
+      data: topology,
+      provider: 'demo',
+      fallback: false,
+    });
     await sleep(260);
   } else {
     topology = await designTopology(sessionId, mission, config);
   }
 
+  setSessionTopology(sessionId, topology);
   emit(sessionId, 'topology', topology);
   if (topology?.health) {
     emit(sessionId, 'topology_audit', topology.health);
   }
   for (const team of topology?.teams || []) {
+    recordTranscript(sessionId, {
+      channel: 'system',
+      kind: 'team_generated',
+      direction: 'event',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      title: `Team generated / ${team.name}`,
+      text: `${team.name} [${team.pattern}] // goal=${team.goal}`,
+      data: team,
+      fallback: Boolean(team.syntheticTeam),
+    });
     if (team.syntheticTeam) {
       emit(sessionId, 'log', {
         level: 'info',
@@ -470,6 +530,22 @@ async function runMagiSession(sessionId, mission, config) {
           agent,
         });
       }
+      recordTranscript(sessionId, {
+        channel: 'system',
+        kind: agent.synthetic ? 'subagent_generated' : 'agent_registered',
+        direction: 'event',
+        teamId: team.id,
+        teamName: team.name,
+        teamPattern: team.pattern,
+        agentId: agent.id,
+        agentName: agent.codename,
+        agentRole: agent.role,
+        model: agent.model,
+        title: `${agent.synthetic ? 'Sub-agent generated' : 'Agent registered'} / ${team.name} / ${agent.codename}`,
+        text: `${agent.codename} (${agent.role}) // stance=${agent.stance || ''} // focus=${agent.focus || ''}`,
+        data: agent,
+        fallback: Boolean(agent.synthetic),
+      });
     }
   }
 
@@ -484,6 +560,7 @@ async function runMagiSession(sessionId, mission, config) {
   const teamResults = await executeTopology(sessionId, mission, topology, config);
   const magiVotes = await runMagiArbitration(sessionId, mission, topology, teamResults, config);
   const finalReport = await synthesizeFinalReport(sessionId, mission, topology, teamResults, magiVotes, config);
+  setSessionFinalReport(sessionId, finalReport);
 
   emit(sessionId, 'phase', {
     phase: 'complete',
@@ -495,10 +572,19 @@ async function runMagiSession(sessionId, mission, config) {
     votes: magiVotes,
     elapsedMs: Date.now() - startedAt,
   });
+  recordTranscript(sessionId, {
+    channel: 'system',
+    kind: 'final_result',
+    direction: 'response',
+    title: 'Final decision lock',
+    text: finalReport?.summary || 'Decision completed.',
+    data: finalReport,
+  });
   emit(sessionId, 'log', {
     level: 'success',
     text: `MAGI consensus cycle completed in ${(Date.now() - startedAt) / 1000}s.`,
   });
+  scheduleSessionPersist(sessionId, 20);
 }
 
 
@@ -533,7 +619,8 @@ async function designTopology(sessionId, mission, config) {
         {
           type: 'input_text',
           text: [
-            `Mission:\n${mission}`,
+            `Mission:
+${mission}`,
             'Constraints:',
             `- max teams: ${config.maxTeams}`,
             `- max agents per team: ${config.maxAgentsPerTeam}`,
@@ -548,7 +635,22 @@ async function designTopology(sessionId, mission, config) {
     },
   ];
 
+  const requestText = flattenInputText(input);
+  const tools = buildOptionalTools(config, { mission, purpose: 'topology' });
+  recordTranscript(sessionId, {
+    channel: 'planner',
+    kind: 'topology_prompt',
+    direction: 'prompt',
+    model: config.models.planner,
+    title: 'Topology planner / request',
+    text: `${instructions}
+
+${requestText}`,
+    data: { schema: TOPOLOGY_SCHEMA.name, tools },
+  });
+
   let rawTopology;
+  const startedAt = Date.now();
   try {
     const result = await callStructuredModel({
       model: config.models.planner,
@@ -556,15 +658,61 @@ async function designTopology(sessionId, mission, config) {
       input,
       schema: TOPOLOGY_SCHEMA,
       reasoning: { effort: 'medium' },
-      tools: buildOptionalTools(config, { mission, purpose: 'topology' }),
+      tools,
     });
     rawTopology = result.json;
+    recordModelCall(sessionId, {
+      kind: 'topology_planner',
+      phase: 'planner',
+      model: config.models.planner,
+      schema: TOPOLOGY_SCHEMA.name,
+      tools,
+      reasoning: { effort: 'medium' },
+      request: { instructions, inputText: requestText },
+      response: { text: result.text, json: result.json },
+      durationMs: Date.now() - startedAt,
+      fallback: false,
+      metadata: { mission },
+    });
+    recordTranscript(sessionId, {
+      channel: 'planner',
+      kind: 'topology_response',
+      direction: 'response',
+      model: config.models.planner,
+      title: 'Topology planner / response',
+      text: result.text || normalizeRecordText(result.json),
+      data: result.json,
+    });
   } catch (error) {
     emit(sessionId, 'log', {
       level: 'warn',
       text: `Planner output fallback engaged: ${error?.message || String(error)}`,
     });
     rawTopology = buildHeuristicTopologyRaw(mission, config);
+    recordModelCall(sessionId, {
+      kind: 'topology_planner',
+      phase: 'planner',
+      model: config.models.planner,
+      schema: TOPOLOGY_SCHEMA.name,
+      tools,
+      reasoning: { effort: 'medium' },
+      request: { instructions, inputText: requestText },
+      response: { text: normalizeRecordText(rawTopology), json: rawTopology },
+      durationMs: Date.now() - startedAt,
+      fallback: true,
+      error: error?.message || String(error),
+      metadata: { mission, source: 'heuristic_fallback' },
+    });
+    recordTranscript(sessionId, {
+      channel: 'planner',
+      kind: 'topology_response',
+      direction: 'response',
+      model: config.models.planner,
+      title: 'Topology planner / fallback response',
+      text: normalizeRecordText(rawTopology),
+      data: rawTopology,
+      fallback: true,
+    });
   }
 
   const topology = normalizeTopology(rawTopology, mission, config);
@@ -647,6 +795,18 @@ async function runTeam(sessionId, mission, topology, team, priorTeamResults, con
     level: 'info',
     text: `Running team ${team.name} [${team.pattern}] with ${team.agents.length} agent(s).`,
   });
+  recordTranscript(sessionId, {
+    channel: 'team',
+    kind: 'team_start',
+    direction: 'event',
+    phase: 'teams',
+    teamId: team.id,
+    teamName: team.name,
+    teamPattern: team.pattern,
+    title: `Team start / ${team.name}`,
+    text: `${team.name} started with ${team.agents.length} agent(s). Goal: ${team.goal}`,
+    data: { team, upstreamTeams: priorTeamResults.map((result) => result.team.id) },
+  });
 
   for (const agent of team.agents) {
     emit(sessionId, 'agent_spawned', {
@@ -691,6 +851,19 @@ async function runTeam(sessionId, mission, topology, team, priorTeamResults, con
     type: 'team-summary',
     text: result.synthesis.summary,
   });
+  upsertTeamArchiveResult(sessionId, result);
+  recordTranscript(sessionId, {
+    channel: 'team',
+    kind: 'team_complete',
+    direction: 'response',
+    phase: 'teams',
+    teamId: team.id,
+    teamName: team.name,
+    teamPattern: team.pattern,
+    title: `Team complete / ${team.name}`,
+    text: result.synthesis?.summary || 'Team completed.',
+    data: result.synthesis,
+  });
 
   emit(sessionId, 'team_result', {
     teamId: team.id,
@@ -705,6 +878,7 @@ async function runTeam(sessionId, mission, topology, team, priorTeamResults, con
 
   return result;
 }
+
 
 async function runRoundtableTeam(sessionId, mission, topology, team, priorTeamResults, config) {
   const rounds = Math.min(team.max_rounds, config.maxRounds);
@@ -1209,6 +1383,12 @@ async function executeTaskGraph({
             `Task dependencies satisfied: ${task.depends_on.join(', ') || 'none'}`,
             'Return a concrete execution update, not abstract commentary.',
           ].join('\n'),
+          recordMeta: {
+            phase: 'teams',
+            kind: `${style}_task_contribution`,
+            taskId: task.id,
+            taskTitle: task.title,
+          },
         });
 
         task.status = 'completed';
@@ -1276,7 +1456,11 @@ async function runMagiArbitration(sessionId, mission, topology, teamResults, con
   const teamSummaryText = teamResults
     .map(
       (result) =>
-        `Team ${result.team.name} [${result.team.pattern}]\nSummary: ${result.synthesis.summary}\nDeliverable: ${result.synthesis.deliverable}\nConclusions: ${result.synthesis.conclusions.join('; ')}\nUnresolved: ${result.synthesis.unresolved.join('; ')}`
+        `Team ${result.team.name} [${result.team.pattern}]
+Summary: ${result.synthesis.summary}
+Deliverable: ${result.synthesis.deliverable}
+Conclusions: ${result.synthesis.conclusions.join('; ')}
+Unresolved: ${result.synthesis.unresolved.join('; ')}`
     )
     .join('\n\n');
 
@@ -1287,7 +1471,45 @@ async function runMagiArbitration(sessionId, mission, topology, teamResults, con
       status: 'running',
     });
 
+    const instructions = `${core.instructions} Return only schema-compliant JSON.`;
+    const input = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: [
+              `Mission:
+${mission}`,
+              `Decision criteria: ${topology.final_arbitration.criteria.join(', ')}`,
+              `Compiled team results:
+${teamSummaryText}`,
+              'Vote approve only if the current multi-team result is ready to stand. Vote hold if more iteration is needed. Vote reject if the proposed direction is materially unsound.',
+            ].join('\n\n'),
+          },
+        ],
+      },
+    ];
+    const requestText = flattenInputText(input);
+
+    recordTranscript(sessionId, {
+      channel: 'magi',
+      kind: 'magi_vote_prompt',
+      direction: 'prompt',
+      phase: 'magi',
+      agentId: core.id,
+      agentName: core.name,
+      agentRole: core.axis,
+      model: config.models.judge,
+      title: `${core.name} / vote prompt`,
+      text: `${instructions}
+
+${requestText}`,
+      data: { schema: MAGI_VOTE_SCHEMA.name },
+    });
+
     let payload;
+    const startedAt = Date.now();
     if (config.mode === 'demo') {
       await sleep(160 + Math.random() * 120);
       payload = {
@@ -1296,27 +1518,27 @@ async function runMagiArbitration(sessionId, mission, topology, teamResults, con
         axis: core.axis,
         ...buildDemoMagiVote(core, teamResults),
       };
+      recordModelCall(sessionId, {
+        kind: 'magi_vote',
+        phase: 'magi',
+        agentId: core.id,
+        agentName: core.name,
+        agentRole: core.axis,
+        model: config.models.judge,
+        schema: MAGI_VOTE_SCHEMA.name,
+        reasoning: { effort: 'medium' },
+        request: { instructions, inputText: requestText },
+        response: { text: normalizeRecordText(payload), json: payload },
+        durationMs: Date.now() - startedAt,
+        fallback: false,
+        provider: 'demo',
+      });
     } else {
       try {
         const result = await callStructuredModel({
           model: config.models.judge,
-          instructions: `${core.instructions} Return only schema-compliant JSON.`,
-          input: [
-            {
-              role: 'user',
-              content: [
-                {
-                  type: 'input_text',
-                  text: [
-                    `Mission:\n${mission}`,
-                    `Decision criteria: ${topology.final_arbitration.criteria.join(', ')}`,
-                    `Compiled team results:\n${teamSummaryText}`,
-                    'Vote approve only if the current multi-team result is ready to stand. Vote hold if more iteration is needed. Vote reject if the proposed direction is materially unsound.',
-                  ].join('\n\n'),
-                },
-              ],
-            },
-          ],
+          instructions,
+          input,
           schema: MAGI_VOTE_SCHEMA,
           reasoning: { effort: 'medium' },
         });
@@ -1327,6 +1549,20 @@ async function runMagiArbitration(sessionId, mission, topology, teamResults, con
           axis: core.axis,
           ...result.json,
         };
+        recordModelCall(sessionId, {
+          kind: 'magi_vote',
+          phase: 'magi',
+          agentId: core.id,
+          agentName: core.name,
+          agentRole: core.axis,
+          model: config.models.judge,
+          schema: MAGI_VOTE_SCHEMA.name,
+          reasoning: { effort: 'medium' },
+          request: { instructions, inputText: requestText },
+          response: { text: result.text, json: payload },
+          durationMs: Date.now() - startedAt,
+          fallback: false,
+        });
       } catch (error) {
         emit(sessionId, 'log', {
           level: 'warn',
@@ -1338,12 +1574,42 @@ async function runMagiArbitration(sessionId, mission, topology, teamResults, con
           axis: core.axis,
           ...buildDemoMagiVote(core, teamResults),
         };
+        recordModelCall(sessionId, {
+          kind: 'magi_vote',
+          phase: 'magi',
+          agentId: core.id,
+          agentName: core.name,
+          agentRole: core.axis,
+          model: config.models.judge,
+          schema: MAGI_VOTE_SCHEMA.name,
+          reasoning: { effort: 'medium' },
+          request: { instructions, inputText: requestText },
+          response: { text: normalizeRecordText(payload), json: payload },
+          durationMs: Date.now() - startedAt,
+          fallback: true,
+          error: error?.message || String(error),
+        });
       }
     }
 
     emit(sessionId, 'magi_vote', {
       ...payload,
       status: 'completed',
+    });
+    upsertMagiVoteArchive(sessionId, { ...payload, status: 'completed' });
+    recordTranscript(sessionId, {
+      channel: 'magi',
+      kind: 'magi_vote_response',
+      direction: 'response',
+      phase: 'magi',
+      agentId: core.id,
+      agentName: core.name,
+      agentRole: core.axis,
+      model: config.models.judge,
+      title: `${core.name} / vote response`,
+      text: `${payload.vote?.toUpperCase() || 'PENDING'} // ${payload.rationale || ''}`,
+      data: payload,
+      fallback: Boolean(payload?.fallback),
     });
     addBlackboardNote(sessionId, {
       source: core.name,
@@ -1379,16 +1645,19 @@ async function synthesizeFinalReport(sessionId, mission, topology, teamResults, 
         {
           type: 'input_text',
           text: [
-            `Mission:\n${mission}`,
+            `Mission:
+${mission}`,
             `Majority vote: ${majorityVote}`,
             `Arbitration criteria: ${topology.final_arbitration.criteria.join(', ')}`,
-            `Team outputs:\n${teamResults
+            `Team outputs:
+${teamResults
               .map(
                 (result) =>
                   `- ${result.team.name} [${result.team.pattern}] => ${result.synthesis.summary} | Deliverable: ${result.synthesis.deliverable}`
               )
               .join('\n')}`,
-            `MAGI chamber:\n${magiVotes
+            `MAGI chamber:
+${magiVotes
               .map((vote) => `- ${vote.name}: ${vote.vote} (${vote.confidence}) => ${vote.rationale}`)
               .join('\n')}`,
             'Write the final answer as a system decision memo for implementation.',
@@ -1397,9 +1666,57 @@ async function synthesizeFinalReport(sessionId, mission, topology, teamResults, 
       ],
     },
   ];
+  const requestText = flattenInputText(input);
 
+  recordTranscript(sessionId, {
+    channel: 'magi',
+    kind: 'final_report_prompt',
+    direction: 'prompt',
+    phase: 'complete',
+    agentId: 'magi-final',
+    agentName: 'MAGI-FINAL',
+    agentRole: 'Final report synthesizer',
+    model: config.models.judge,
+    title: 'MAGI final report / prompt',
+    text: `${instructions}
+
+${requestText}`,
+    data: { schema: FINAL_REPORT_SCHEMA.name, majorityVote },
+  });
+
+  const startedAt = Date.now();
   if (config.mode === 'demo') {
-    return buildDemoFinalReport(mission, teamResults, magiVotes);
+    const demo = buildDemoFinalReport(mission, teamResults, magiVotes);
+    recordModelCall(sessionId, {
+      kind: 'final_report',
+      phase: 'complete',
+      agentId: 'magi-final',
+      agentName: 'MAGI-FINAL',
+      agentRole: 'Final report synthesizer',
+      model: config.models.judge,
+      schema: FINAL_REPORT_SCHEMA.name,
+      reasoning: { effort: 'medium' },
+      request: { instructions, inputText: requestText },
+      response: { text: normalizeRecordText(demo), json: demo },
+      durationMs: Date.now() - startedAt,
+      fallback: false,
+      provider: 'demo',
+    });
+    recordTranscript(sessionId, {
+      channel: 'magi',
+      kind: 'final_report_response',
+      direction: 'response',
+      phase: 'complete',
+      agentId: 'magi-final',
+      agentName: 'MAGI-FINAL',
+      agentRole: 'Final report synthesizer',
+      model: config.models.judge,
+      provider: 'demo',
+      title: 'MAGI final report / response',
+      text: normalizeRecordText(demo),
+      data: demo,
+    });
+    return demo;
   }
 
   try {
@@ -1410,13 +1727,70 @@ async function synthesizeFinalReport(sessionId, mission, topology, teamResults, 
       schema: FINAL_REPORT_SCHEMA,
       reasoning: { effort: 'medium' },
     });
+    recordModelCall(sessionId, {
+      kind: 'final_report',
+      phase: 'complete',
+      agentId: 'magi-final',
+      agentName: 'MAGI-FINAL',
+      agentRole: 'Final report synthesizer',
+      model: config.models.judge,
+      schema: FINAL_REPORT_SCHEMA.name,
+      reasoning: { effort: 'medium' },
+      request: { instructions, inputText: requestText },
+      response: { text: report.text, json: report.json },
+      durationMs: Date.now() - startedAt,
+      fallback: false,
+    });
+    recordTranscript(sessionId, {
+      channel: 'magi',
+      kind: 'final_report_response',
+      direction: 'response',
+      phase: 'complete',
+      agentId: 'magi-final',
+      agentName: 'MAGI-FINAL',
+      agentRole: 'Final report synthesizer',
+      model: config.models.judge,
+      title: 'MAGI final report / response',
+      text: report.text || normalizeRecordText(report.json),
+      data: report.json,
+    });
     return report.json;
   } catch (error) {
     emit(sessionId, 'log', {
       level: 'warn',
       text: `Final report fallback engaged: ${error?.message || String(error)}`,
     });
-    return buildDemoFinalReport(mission, teamResults, magiVotes);
+    const fallback = buildDemoFinalReport(mission, teamResults, magiVotes);
+    recordModelCall(sessionId, {
+      kind: 'final_report',
+      phase: 'complete',
+      agentId: 'magi-final',
+      agentName: 'MAGI-FINAL',
+      agentRole: 'Final report synthesizer',
+      model: config.models.judge,
+      schema: FINAL_REPORT_SCHEMA.name,
+      reasoning: { effort: 'medium' },
+      request: { instructions, inputText: requestText },
+      response: { text: normalizeRecordText(fallback), json: fallback },
+      durationMs: Date.now() - startedAt,
+      fallback: true,
+      error: error?.message || String(error),
+    });
+    recordTranscript(sessionId, {
+      channel: 'magi',
+      kind: 'final_report_response',
+      direction: 'response',
+      phase: 'complete',
+      agentId: 'magi-final',
+      agentName: 'MAGI-FINAL',
+      agentRole: 'Final report synthesizer',
+      model: config.models.judge,
+      title: 'MAGI final report / fallback response',
+      text: normalizeRecordText(fallback),
+      data: fallback,
+      fallback: true,
+    });
+    return fallback;
   }
 }
 
@@ -1430,23 +1804,132 @@ async function callAgentContribution({
   priorTeamResults,
   config,
   extraInstructions,
+  recordMeta = {},
 }) {
-  if (config.mode === 'demo') {
-    await sleep(220 + Math.random() * 180);
-    return buildDemoContribution(agent, team, mission, extraInstructions);
-  }
-
+  const model = agent.model || config.models.worker;
   const instructions = buildAgentInstructions(agent, team, config, extraInstructions);
   const input = buildAgentInput(mission, topology, team, priorTeamResults, sessionId);
+  const requestText = flattenInputText(input);
+  const tools = buildOptionalTools(config, { mission, purpose: team.goal, team, agent });
+  const phase = recordMeta.phase || 'teams';
+  const kind = recordMeta.kind || 'agent_contribution';
+
+  recordTranscript(sessionId, {
+    channel: 'agent',
+    kind: `${kind}_prompt`,
+    direction: 'prompt',
+    phase,
+    teamId: team.id,
+    teamName: team.name,
+    teamPattern: team.pattern,
+    agentId: agent.id,
+    agentName: agent.codename,
+    agentRole: agent.role,
+    taskId: recordMeta.taskId || null,
+    taskTitle: recordMeta.taskTitle || null,
+    model,
+    title: `${team.name} / ${agent.codename} / prompt`,
+    text: `${instructions}
+
+${requestText}`,
+    data: { schema: CONTRIBUTION_SCHEMA.name, tools },
+  });
+
+  const startedAt = Date.now();
+  if (config.mode === 'demo') {
+    await sleep(220 + Math.random() * 180);
+    const demo = buildDemoContribution(agent, team, mission, extraInstructions);
+    recordModelCall(sessionId, {
+      kind,
+      phase,
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: agent.id,
+      agentName: agent.codename,
+      agentRole: agent.role,
+      taskId: recordMeta.taskId || null,
+      taskTitle: recordMeta.taskTitle || null,
+      model,
+      schema: CONTRIBUTION_SCHEMA.name,
+      tools,
+      reasoning: { effort: 'low' },
+      request: { instructions, inputText: requestText },
+      response: { text: serializeContribution(demo), json: demo },
+      durationMs: Date.now() - startedAt,
+      fallback: false,
+      provider: 'demo',
+      metadata: recordMeta,
+    });
+    recordTranscript(sessionId, {
+      channel: 'agent',
+      kind: `${kind}_response`,
+      direction: 'response',
+      phase,
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: agent.id,
+      agentName: agent.codename,
+      agentRole: agent.role,
+      taskId: recordMeta.taskId || null,
+      taskTitle: recordMeta.taskTitle || null,
+      model,
+      provider: 'demo',
+      title: `${team.name} / ${agent.codename} / response`,
+      text: serializeContribution(demo),
+      data: demo,
+    });
+    return demo;
+  }
 
   try {
     const result = await callStructuredModel({
-      model: agent.model || config.models.worker,
+      model,
       instructions,
       input,
       schema: CONTRIBUTION_SCHEMA,
       reasoning: { effort: 'low' },
-      tools: buildOptionalTools(config, { mission, purpose: team.goal, team, agent }),
+      tools,
+    });
+    recordModelCall(sessionId, {
+      kind,
+      phase,
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: agent.id,
+      agentName: agent.codename,
+      agentRole: agent.role,
+      taskId: recordMeta.taskId || null,
+      taskTitle: recordMeta.taskTitle || null,
+      model,
+      schema: CONTRIBUTION_SCHEMA.name,
+      tools,
+      reasoning: { effort: 'low' },
+      request: { instructions, inputText: requestText },
+      response: { text: result.text, json: result.json },
+      durationMs: Date.now() - startedAt,
+      fallback: false,
+      metadata: recordMeta,
+    });
+    recordTranscript(sessionId, {
+      channel: 'agent',
+      kind: `${kind}_response`,
+      direction: 'response',
+      phase,
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: agent.id,
+      agentName: agent.codename,
+      agentRole: agent.role,
+      taskId: recordMeta.taskId || null,
+      taskTitle: recordMeta.taskTitle || null,
+      model,
+      title: `${team.name} / ${agent.codename} / response`,
+      text: result.text || serializeContribution(result.json),
+      data: result.json,
     });
     return result.json;
   } catch (error) {
@@ -1454,7 +1937,49 @@ async function callAgentContribution({
       level: 'warn',
       text: `Contribution fallback engaged for ${team.name}/${agent.codename}: ${error?.message || String(error)}`,
     });
-    return buildDemoContribution(agent, team, mission, extraInstructions);
+    const fallback = buildDemoContribution(agent, team, mission, extraInstructions);
+    recordModelCall(sessionId, {
+      kind,
+      phase,
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: agent.id,
+      agentName: agent.codename,
+      agentRole: agent.role,
+      taskId: recordMeta.taskId || null,
+      taskTitle: recordMeta.taskTitle || null,
+      model,
+      schema: CONTRIBUTION_SCHEMA.name,
+      tools,
+      reasoning: { effort: 'low' },
+      request: { instructions, inputText: requestText },
+      response: { text: serializeContribution(fallback), json: fallback },
+      durationMs: Date.now() - startedAt,
+      fallback: true,
+      error: error?.message || String(error),
+      metadata: recordMeta,
+    });
+    recordTranscript(sessionId, {
+      channel: 'agent',
+      kind: `${kind}_response`,
+      direction: 'response',
+      phase,
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: agent.id,
+      agentName: agent.codename,
+      agentRole: agent.role,
+      taskId: recordMeta.taskId || null,
+      taskTitle: recordMeta.taskTitle || null,
+      model,
+      title: `${team.name} / ${agent.codename} / fallback response`,
+      text: serializeContribution(fallback),
+      data: fallback,
+      fallback: true,
+    });
+    return fallback;
   }
 }
 
@@ -1469,25 +1994,120 @@ async function callTaskPlanner({
   config,
   extraInstructions,
 }) {
-  if (config.mode === 'demo') {
-    await sleep(300);
-    return buildDemoTaskGraph(team);
-  }
-
   const instructions = [
     buildAgentInstructions(agent, team, config, extraInstructions),
     'Produce an execution graph with explicit task dependencies. Favor concise, high-signal tasks.',
   ].join('\n\n');
 
+  const model = agent.model || config.models.worker;
   const input = buildAgentInput(mission, topology, team, priorTeamResults, sessionId);
+  const requestText = flattenInputText(input);
+  const tools = buildOptionalTools(config, { mission, purpose: team.goal, team, agent });
+
+  recordTranscript(sessionId, {
+    channel: 'team',
+    kind: 'task_planner_prompt',
+    direction: 'prompt',
+    phase: 'teams',
+    teamId: team.id,
+    teamName: team.name,
+    teamPattern: team.pattern,
+    agentId: agent.id,
+    agentName: agent.codename,
+    agentRole: agent.role,
+    model,
+    title: `${team.name} / task planner / prompt`,
+    text: `${instructions}
+
+${requestText}`,
+    data: { schema: TASK_GRAPH_SCHEMA.name, tools },
+  });
+
+  const startedAt = Date.now();
+  if (config.mode === 'demo') {
+    await sleep(300);
+    const demo = buildDemoTaskGraph(team);
+    recordModelCall(sessionId, {
+      kind: 'task_planner',
+      phase: 'teams',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: agent.id,
+      agentName: agent.codename,
+      agentRole: agent.role,
+      model,
+      schema: TASK_GRAPH_SCHEMA.name,
+      tools,
+      reasoning: { effort: 'low' },
+      request: { instructions, inputText: requestText },
+      response: { text: normalizeRecordText(demo), json: demo },
+      durationMs: Date.now() - startedAt,
+      fallback: false,
+      provider: 'demo',
+    });
+    recordTranscript(sessionId, {
+      channel: 'team',
+      kind: 'task_planner_response',
+      direction: 'response',
+      phase: 'teams',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: agent.id,
+      agentName: agent.codename,
+      agentRole: agent.role,
+      model,
+      provider: 'demo',
+      title: `${team.name} / task planner / response`,
+      text: normalizeRecordText(demo),
+      data: demo,
+    });
+    return demo;
+  }
+
   try {
     const result = await callStructuredModel({
-      model: agent.model || config.models.worker,
+      model,
       instructions,
       input,
       schema: TASK_GRAPH_SCHEMA,
       reasoning: { effort: 'low' },
-      tools: buildOptionalTools(config, { mission, purpose: team.goal, team, agent }),
+      tools,
+    });
+    recordModelCall(sessionId, {
+      kind: 'task_planner',
+      phase: 'teams',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: agent.id,
+      agentName: agent.codename,
+      agentRole: agent.role,
+      model,
+      schema: TASK_GRAPH_SCHEMA.name,
+      tools,
+      reasoning: { effort: 'low' },
+      request: { instructions, inputText: requestText },
+      response: { text: result.text, json: result.json },
+      durationMs: Date.now() - startedAt,
+      fallback: false,
+    });
+    recordTranscript(sessionId, {
+      channel: 'team',
+      kind: 'task_planner_response',
+      direction: 'response',
+      phase: 'teams',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: agent.id,
+      agentName: agent.codename,
+      agentRole: agent.role,
+      model,
+      title: `${team.name} / task planner / response`,
+      text: result.text || normalizeRecordText(result.json),
+      data: result.json,
     });
 
     return result.json;
@@ -1496,7 +2116,44 @@ async function callTaskPlanner({
       level: 'warn',
       text: `Task planner fallback engaged for ${team.name}/${agent.codename}: ${error?.message || String(error)}`,
     });
-    return buildDemoTaskGraph(team);
+    const fallback = buildDemoTaskGraph(team);
+    recordModelCall(sessionId, {
+      kind: 'task_planner',
+      phase: 'teams',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: agent.id,
+      agentName: agent.codename,
+      agentRole: agent.role,
+      model,
+      schema: TASK_GRAPH_SCHEMA.name,
+      tools,
+      reasoning: { effort: 'low' },
+      request: { instructions, inputText: requestText },
+      response: { text: normalizeRecordText(fallback), json: fallback },
+      durationMs: Date.now() - startedAt,
+      fallback: true,
+      error: error?.message || String(error),
+    });
+    recordTranscript(sessionId, {
+      channel: 'team',
+      kind: 'task_planner_response',
+      direction: 'response',
+      phase: 'teams',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: agent.id,
+      agentName: agent.codename,
+      agentRole: agent.role,
+      model,
+      title: `${team.name} / task planner / fallback response`,
+      text: normalizeRecordText(fallback),
+      data: fallback,
+      fallback: true,
+    });
+    return fallback;
   }
 }
 
@@ -1512,11 +2169,6 @@ async function synthesizeTeam({
   extraInstructions,
   forcedLead,
 }) {
-  if (config.mode === 'demo') {
-    await sleep(280);
-    return buildDemoSynthesis(team, contributions);
-  }
-
   const lead = forcedLead || team.agents[0];
   const instructions = [
     buildAgentInstructions(lead, team, config, extraInstructions),
@@ -1526,7 +2178,8 @@ async function synthesizeTeam({
   const contributionText = contributions
     .map(({ agent, contribution }, index) => {
       const name = agent?.codename || `Agent-${index + 1}`;
-      return `Contributor: ${name}\n${serializeContribution(contribution)}`;
+      return `Contributor: ${name}
+${serializeContribution(contribution)}`;
     })
     .join('\n\n');
 
@@ -1537,25 +2190,127 @@ async function synthesizeTeam({
         {
           type: 'input_text',
           text: [
-            `Mission:\n${mission}`,
-            `Team:\n${team.name} [${team.pattern}]`,
-            `Team goal:\n${team.goal}`,
-            `Requested deliverable:\n${team.deliverable}`,
-            `Relevant upstream team results:\n${compactPriorTeamResults(priorTeamResults)}`,
-            `Team contributions:\n${contributionText}`,
+            `Mission:
+${mission}`,
+            `Team:
+${team.name} [${team.pattern}]`,
+            `Team goal:
+${team.goal}`,
+            `Requested deliverable:
+${team.deliverable}`,
+            `Relevant upstream team results:
+${compactPriorTeamResults(priorTeamResults)}`,
+            `Team contributions:
+${contributionText}`,
           ].join('\n\n'),
         },
       ],
     },
   ];
 
+  const model = config.models.judge;
+  const requestText = flattenInputText(input);
+  recordTranscript(sessionId, {
+    channel: 'team',
+    kind: 'team_synthesis_prompt',
+    direction: 'prompt',
+    phase: 'teams',
+    teamId: team.id,
+    teamName: team.name,
+    teamPattern: team.pattern,
+    agentId: lead.id,
+    agentName: lead.codename,
+    agentRole: lead.role,
+    model,
+    title: `${team.name} / synthesis / prompt`,
+    text: `${instructions}
+
+${requestText}`,
+    data: { schema: TEAM_SYNTHESIS_SCHEMA.name, contributionCount: contributions.length },
+  });
+
+  const startedAt = Date.now();
+  if (config.mode === 'demo') {
+    await sleep(280);
+    const demo = buildDemoSynthesis(team, contributions);
+    recordModelCall(sessionId, {
+      kind: 'team_synthesis',
+      phase: 'teams',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: lead.id,
+      agentName: lead.codename,
+      agentRole: lead.role,
+      model,
+      schema: TEAM_SYNTHESIS_SCHEMA.name,
+      reasoning: { effort: 'medium' },
+      request: { instructions, inputText: requestText },
+      response: { text: normalizeRecordText(demo), json: demo },
+      durationMs: Date.now() - startedAt,
+      fallback: false,
+      provider: 'demo',
+    });
+    recordTranscript(sessionId, {
+      channel: 'team',
+      kind: 'team_synthesis_response',
+      direction: 'response',
+      phase: 'teams',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: lead.id,
+      agentName: lead.codename,
+      agentRole: lead.role,
+      model,
+      provider: 'demo',
+      title: `${team.name} / synthesis / response`,
+      text: normalizeRecordText(demo),
+      data: demo,
+    });
+    return demo;
+  }
+
   try {
     const result = await callStructuredModel({
-      model: config.models.judge,
+      model,
       instructions,
       input,
       schema: TEAM_SYNTHESIS_SCHEMA,
       reasoning: { effort: 'medium' },
+    });
+    recordModelCall(sessionId, {
+      kind: 'team_synthesis',
+      phase: 'teams',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: lead.id,
+      agentName: lead.codename,
+      agentRole: lead.role,
+      model,
+      schema: TEAM_SYNTHESIS_SCHEMA.name,
+      reasoning: { effort: 'medium' },
+      request: { instructions, inputText: requestText },
+      response: { text: result.text, json: result.json },
+      durationMs: Date.now() - startedAt,
+      fallback: false,
+    });
+    recordTranscript(sessionId, {
+      channel: 'team',
+      kind: 'team_synthesis_response',
+      direction: 'response',
+      phase: 'teams',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: lead.id,
+      agentName: lead.codename,
+      agentRole: lead.role,
+      model,
+      title: `${team.name} / synthesis / response`,
+      text: result.text || normalizeRecordText(result.json),
+      data: result.json,
     });
     return result.json;
   } catch (error) {
@@ -1563,7 +2318,43 @@ async function synthesizeTeam({
       level: 'warn',
       text: `Team synthesis fallback engaged for ${team.name}: ${error?.message || String(error)}`,
     });
-    return buildDemoSynthesis(team, contributions);
+    const fallback = buildDemoSynthesis(team, contributions);
+    recordModelCall(sessionId, {
+      kind: 'team_synthesis',
+      phase: 'teams',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: lead.id,
+      agentName: lead.codename,
+      agentRole: lead.role,
+      model,
+      schema: TEAM_SYNTHESIS_SCHEMA.name,
+      reasoning: { effort: 'medium' },
+      request: { instructions, inputText: requestText },
+      response: { text: normalizeRecordText(fallback), json: fallback },
+      durationMs: Date.now() - startedAt,
+      fallback: true,
+      error: error?.message || String(error),
+    });
+    recordTranscript(sessionId, {
+      channel: 'team',
+      kind: 'team_synthesis_response',
+      direction: 'response',
+      phase: 'teams',
+      teamId: team.id,
+      teamName: team.name,
+      teamPattern: team.pattern,
+      agentId: lead.id,
+      agentName: lead.codename,
+      agentRole: lead.role,
+      model,
+      title: `${team.name} / synthesis / fallback response`,
+      text: normalizeRecordText(fallback),
+      data: fallback,
+      fallback: true,
+    });
+    return fallback;
   }
 }
 
@@ -2296,23 +3087,574 @@ function addBlackboardNote(sessionId, note) {
   session.state.blackboard.push(entry);
   session.state.blackboard = session.state.blackboard.slice(-80);
   emit(sessionId, 'blackboard_note', entry);
+  recordTranscript(sessionId, {
+    channel: 'blackboard',
+    kind: 'blackboard_note',
+    direction: 'event',
+    teamId: entry.teamId,
+    agentId: entry.agentId,
+    title: `${entry.source} → BLACKBOARD`,
+    text: entry.text,
+    data: entry,
+  });
 }
 
 function createSession() {
+  const sessionId = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
   const session = {
-    id: crypto.randomUUID(),
-    createdAt: new Date().toISOString(),
+    id: sessionId,
+    createdAt,
     history: [],
     clients: new Set(),
+    eventSeq: 0,
+    transcriptSeq: 0,
+    modelCallSeq: 0,
     state: {
       blackboard: [],
       mission: '',
       config: null,
     },
+    archive: buildEmptyArchive(sessionId, createdAt),
     running: false,
   };
   sessions.set(session.id, session);
+  scheduleSessionPersist(session.id, 20);
   return session;
+}
+
+function buildEmptyArchive(sessionId, createdAt) {
+  return {
+    sessionId,
+    createdAt,
+    updatedAt: createdAt,
+    mission: '',
+    config: null,
+    runtime: {
+      host: HOST,
+      preferredPort: PREFERRED_PORT,
+      activePort: ACTIVE_PORT,
+      apiBaseUrl: OPENAI_BASE_URL,
+      openaiConfigured: Boolean(OPENAI_API_KEY),
+      mode: null,
+    },
+    topology: null,
+    transcript: [],
+    modelCalls: [],
+    teamResults: [],
+    magiVotes: [],
+    finalReport: null,
+    files: buildArchiveFileRefs(sessionId),
+    stats: {
+      eventCount: 0,
+      transcriptTurns: 0,
+      modelCalls: 0,
+      teamCount: 0,
+      agentCount: 0,
+      syntheticTeams: 0,
+      syntheticAgents: 0,
+    },
+  };
+}
+
+function buildArchiveFileRefs(sessionId) {
+  return {
+    json: `data/sessions/${sessionId}.json`,
+    markdown: `data/sessions/${sessionId}.md`,
+  };
+}
+
+function buildArchiveAbsolutePaths(sessionId) {
+  return {
+    json: path.join(SESSION_ARCHIVE_DIR, `${sessionId}.json`),
+    markdown: path.join(SESSION_ARCHIVE_DIR, `${sessionId}.md`),
+  };
+}
+
+async function ensureRuntimeDirs() {
+  await fsp.mkdir(SESSION_ARCHIVE_DIR, { recursive: true });
+}
+
+function cloneSerializable(value) {
+  if (value === undefined) return null;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return typeof value === 'string' ? value : String(value);
+  }
+}
+
+function safeJsonStringify(value, space = 2) {
+  try {
+    return JSON.stringify(value, null, space);
+  } catch {
+    return String(value);
+  }
+}
+
+function normalizeRecordText(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value.trim();
+  return safeJsonStringify(value, 2);
+}
+
+function flattenInputText(input) {
+  if (!Array.isArray(input)) return normalizeRecordText(input);
+  const parts = [];
+  for (const message of input) {
+    const role = String(message?.role || 'unknown').toUpperCase();
+    const contentText = Array.isArray(message?.content)
+      ? message.content
+          .map((content) => {
+            if (typeof content === 'string') return content;
+            if (content?.type === 'input_text' || content?.type === 'output_text' || content?.type === 'text') {
+              return content?.text || '';
+            }
+            return safeJsonStringify(content, 2);
+          })
+          .filter(Boolean)
+          .join('\n')
+      : normalizeRecordText(message?.content);
+    parts.push(`[${role}]\n${contentText}`.trim());
+  }
+  return parts.join('\n\n').trim();
+}
+
+function buildRecordTitle(parts = []) {
+  return parts.filter(Boolean).join(' / ');
+}
+
+function touchArchive(archive) {
+  if (!archive) return;
+  archive.updatedAt = new Date().toISOString();
+  archive.runtime.activePort = ACTIVE_PORT;
+}
+
+function updateSessionArchiveMeta(sessionId, { mission, config } = {}) {
+  const session = getSessionOrNull(sessionId);
+  if (!session) return;
+  if (mission !== undefined) {
+    session.archive.mission = String(mission || '');
+  }
+  if (config !== undefined) {
+    session.archive.config = cloneSerializable(config);
+    session.archive.runtime.mode = config?.mode || null;
+  }
+  touchArchive(session.archive);
+  scheduleSessionPersist(sessionId, 40);
+}
+
+function recordTranscript(sessionId, entry) {
+  const session = getSessionOrNull(sessionId);
+  if (!session) return null;
+  const archive = session.archive;
+  const turn = {
+    id: (session.transcriptSeq = Number(session.transcriptSeq || 0) + 1),
+    ts: Date.now(),
+    isoTime: new Date().toISOString(),
+    channel: entry.channel || 'system',
+    kind: entry.kind || 'note',
+    direction: entry.direction || 'event',
+    phase: entry.phase || null,
+    teamId: entry.teamId || null,
+    teamName: entry.teamName || null,
+    teamPattern: entry.teamPattern || null,
+    agentId: entry.agentId || null,
+    agentName: entry.agentName || null,
+    agentRole: entry.agentRole || null,
+    taskId: entry.taskId || null,
+    taskTitle: entry.taskTitle || null,
+    model: entry.model || null,
+    provider: entry.provider || (session.state.config?.mode === 'demo' ? 'demo' : 'openai'),
+    fallback: Boolean(entry.fallback),
+    title: entry.title || buildRecordTitle([entry.teamName, entry.agentName, entry.kind]),
+    text: normalizeRecordText(entry.text),
+    data: entry.data === undefined ? null : cloneSerializable(entry.data),
+  };
+  archive.transcript.push(turn);
+  if (archive.transcript.length > MAX_TRANSCRIPT_ENTRIES) {
+    archive.transcript = archive.transcript.slice(-MAX_TRANSCRIPT_ENTRIES);
+  }
+  archive.stats.transcriptTurns = archive.transcript.length;
+  touchArchive(archive);
+  scheduleSessionPersist(sessionId);
+  return turn;
+}
+
+function recordModelCall(sessionId, entry) {
+  const session = getSessionOrNull(sessionId);
+  if (!session) return null;
+  const archive = session.archive;
+  const call = {
+    id: (session.modelCallSeq = Number(session.modelCallSeq || 0) + 1),
+    ts: Date.now(),
+    isoTime: new Date().toISOString(),
+    kind: entry.kind || 'model_call',
+    phase: entry.phase || null,
+    teamId: entry.teamId || null,
+    teamName: entry.teamName || null,
+    teamPattern: entry.teamPattern || null,
+    agentId: entry.agentId || null,
+    agentName: entry.agentName || null,
+    agentRole: entry.agentRole || null,
+    taskId: entry.taskId || null,
+    taskTitle: entry.taskTitle || null,
+    model: entry.model || null,
+    schema: entry.schema || null,
+    provider: entry.provider || (session.state.config?.mode === 'demo' ? 'demo' : 'openai'),
+    tools: entry.tools ? cloneSerializable(entry.tools) : [],
+    reasoning: entry.reasoning ? cloneSerializable(entry.reasoning) : null,
+    request: {
+      instructions: normalizeRecordText(entry.request?.instructions),
+      inputText: normalizeRecordText(entry.request?.inputText),
+    },
+    response: {
+      text: normalizeRecordText(entry.response?.text),
+      json: entry.response?.json === undefined ? null : cloneSerializable(entry.response.json),
+    },
+    fallback: Boolean(entry.fallback),
+    durationMs: Number.isFinite(entry.durationMs) ? Math.round(entry.durationMs) : null,
+    error: entry.error ? String(entry.error) : null,
+    metadata: entry.metadata ? cloneSerializable(entry.metadata) : null,
+  };
+  archive.modelCalls.push(call);
+  if (archive.modelCalls.length > MAX_MODEL_CALLS) {
+    archive.modelCalls = archive.modelCalls.slice(-MAX_MODEL_CALLS);
+  }
+  archive.stats.modelCalls = archive.modelCalls.length;
+  touchArchive(archive);
+  scheduleSessionPersist(sessionId);
+  return call;
+}
+
+function setSessionTopology(sessionId, topology) {
+  const session = getSessionOrNull(sessionId);
+  if (!session) return;
+  session.archive.topology = cloneSerializable(topology);
+  if (Array.isArray(topology?.teams)) {
+    session.archive.stats.teamCount = topology.teams.length;
+    session.archive.stats.agentCount = topology.teams.reduce(
+      (sum, team) => sum + (Array.isArray(team.agents) ? team.agents.length : 0),
+      0
+    );
+    session.archive.stats.syntheticTeams = topology.teams.filter((team) => Boolean(team.syntheticTeam)).length;
+    session.archive.stats.syntheticAgents = topology.teams.reduce(
+      (sum, team) =>
+        sum +
+        (Array.isArray(team.agents) ? team.agents.filter((agent) => Boolean(agent.synthetic)).length : 0),
+      0
+    );
+  }
+  touchArchive(session.archive);
+  scheduleSessionPersist(sessionId, 30);
+}
+
+function upsertTeamArchiveResult(sessionId, result) {
+  const session = getSessionOrNull(sessionId);
+  if (!session || !result?.team?.id) return;
+  const teamId = result.team.id;
+  const next = {
+    teamId,
+    teamName: result.team.name,
+    pattern: result.team.pattern,
+    syntheticTeam: Boolean(result.team.syntheticTeam),
+    contributionCount: Array.isArray(result.contributions) ? result.contributions.length : 0,
+    taskCount: Array.isArray(result.tasks) ? result.tasks.length : Array.isArray(result.taskGraph?.tasks) ? result.taskGraph.tasks.length : 0,
+    transcriptTurns: session.archive.transcript.filter((turn) => turn.teamId === teamId).length,
+    synthesis: cloneSerializable(result.synthesis),
+    deliverable: result.team.deliverable || result.synthesis?.deliverable || '',
+    completedAt: new Date().toISOString(),
+  };
+  const index = session.archive.teamResults.findIndex((item) => item.teamId === teamId);
+  if (index >= 0) {
+    session.archive.teamResults[index] = { ...session.archive.teamResults[index], ...next };
+  } else {
+    session.archive.teamResults.push(next);
+  }
+  touchArchive(session.archive);
+  scheduleSessionPersist(sessionId, 30);
+}
+
+function upsertMagiVoteArchive(sessionId, vote) {
+  const session = getSessionOrNull(sessionId);
+  if (!session || !vote?.core) return;
+  const index = session.archive.magiVotes.findIndex((item) => item.core === vote.core);
+  const next = { ...cloneSerializable(vote), updatedAt: new Date().toISOString() };
+  if (index >= 0) {
+    session.archive.magiVotes[index] = { ...session.archive.magiVotes[index], ...next };
+  } else {
+    session.archive.magiVotes.push(next);
+  }
+  touchArchive(session.archive);
+  scheduleSessionPersist(sessionId, 30);
+}
+
+function setSessionFinalReport(sessionId, report) {
+  const session = getSessionOrNull(sessionId);
+  if (!session) return;
+  session.archive.finalReport = cloneSerializable(report);
+  touchArchive(session.archive);
+  scheduleSessionPersist(sessionId, 20);
+}
+
+function buildSessionArchiveDownloadUrl(sessionId, format) {
+  return `/api/export?session=${encodeURIComponent(sessionId)}&format=${encodeURIComponent(format)}`;
+}
+
+function buildSessionArchiveSummary(session) {
+  const archive = session.archive;
+  return {
+    ok: true,
+    sessionId: session.id,
+    createdAt: session.createdAt,
+    updatedAt: archive.updatedAt,
+    running: Boolean(session.running),
+    mission: archive.mission,
+    config: cloneSerializable(archive.config),
+    stats: cloneSerializable(archive.stats),
+    topologyHealth: cloneSerializable(archive.topology?.health || null),
+    teamResults: cloneSerializable(archive.teamResults),
+    magiVotes: cloneSerializable(archive.magiVotes),
+    finalReport: archive.finalReport
+      ? {
+          majority_vote: archive.finalReport.majority_vote,
+          summary: archive.finalReport.summary,
+        }
+      : null,
+    recentTranscript: cloneSerializable(archive.transcript.slice(-18).reverse()),
+    files: {
+      ...cloneSerializable(archive.files),
+      jsonUrl: buildSessionArchiveDownloadUrl(session.id, 'json'),
+      markdownUrl: buildSessionArchiveDownloadUrl(session.id, 'md'),
+    },
+  };
+}
+
+function buildSessionArchiveDocument(session) {
+  const archive = session.archive;
+  return {
+    ok: true,
+    sessionId: session.id,
+    createdAt: session.createdAt,
+    updatedAt: archive.updatedAt,
+    running: Boolean(session.running),
+    mission: archive.mission,
+    config: cloneSerializable(archive.config),
+    runtime: cloneSerializable(archive.runtime),
+    topology: cloneSerializable(archive.topology),
+    stats: cloneSerializable(archive.stats),
+    teamResults: cloneSerializable(archive.teamResults),
+    magiVotes: cloneSerializable(archive.magiVotes),
+    finalReport: cloneSerializable(archive.finalReport),
+    blackboard: cloneSerializable(session.state.blackboard),
+    transcript: cloneSerializable(archive.transcript),
+    modelCalls: cloneSerializable(archive.modelCalls),
+    eventHistory: cloneSerializable(session.history),
+    files: {
+      ...cloneSerializable(archive.files),
+      jsonUrl: buildSessionArchiveDownloadUrl(session.id, 'json'),
+      markdownUrl: buildSessionArchiveDownloadUrl(session.id, 'md'),
+    },
+  };
+}
+
+function sanitizeFenceText(value) {
+  return String(value || '').replaceAll('```', "''' ");
+}
+
+function buildSessionArchiveMarkdown(session) {
+  const doc = buildSessionArchiveDocument(session);
+  const lines = [];
+  lines.push('# MAGI Session Archive');
+  lines.push('');
+  lines.push(`- Session ID: ${doc.sessionId}`);
+  lines.push(`- Created At: ${doc.createdAt}`);
+  lines.push(`- Updated At: ${doc.updatedAt}`);
+  lines.push(`- Running: ${doc.running}`);
+  lines.push(`- Mode: ${doc.config?.mode || 'unknown'}`);
+  lines.push(`- API Base: ${doc.runtime?.apiBaseUrl || OPENAI_BASE_URL}`);
+  lines.push('');
+  lines.push('## Mission');
+  lines.push('');
+  lines.push(doc.mission || '(empty)');
+  lines.push('');
+
+  if (doc.topology) {
+    lines.push('## Topology');
+    lines.push('');
+    lines.push(`- Interpretation: ${doc.topology.interpretation || ''}`);
+    lines.push(`- Teams: ${doc.stats?.teamCount || 0}`);
+    lines.push(`- Agents: ${doc.stats?.agentCount || 0}`);
+    lines.push(`- Synthetic Teams: ${doc.stats?.syntheticTeams || 0}`);
+    lines.push(`- Synthetic Agents: ${doc.stats?.syntheticAgents || 0}`);
+    lines.push('');
+    for (const team of doc.topology.teams || []) {
+      lines.push(`### ${team.name} [${team.pattern}]`);
+      lines.push('');
+      lines.push(`- Team ID: ${team.id}`);
+      lines.push(`- Goal: ${team.goal}`);
+      lines.push(`- Deliverable: ${team.deliverable}`);
+      lines.push(`- Dependencies: ${(team.depends_on || []).join(', ') || 'none'}`);
+      lines.push(`- Synthetic Team: ${Boolean(team.syntheticTeam)}`);
+      lines.push(`- Agents: ${(team.agents || []).map((agent) => `${agent.codename} (${agent.role})`).join(', ') || 'none'}`);
+      lines.push('');
+    }
+  }
+
+  if (Array.isArray(doc.teamResults) && doc.teamResults.length > 0) {
+    lines.push('## Team Results');
+    lines.push('');
+    for (const result of doc.teamResults) {
+      lines.push(`### ${result.teamName} [${result.pattern}]`);
+      lines.push('');
+      lines.push(`- Team ID: ${result.teamId}`);
+      lines.push(`- Deliverable: ${result.deliverable || ''}`);
+      lines.push(`- Contribution Count: ${result.contributionCount || 0}`);
+      lines.push(`- Task Count: ${result.taskCount || 0}`);
+      lines.push(`- Transcript Turns: ${result.transcriptTurns || 0}`);
+      lines.push(`- Readiness: ${result.synthesis?.readiness || 'unknown'}`);
+      lines.push('');
+      if (result.synthesis?.summary) {
+        lines.push(result.synthesis.summary);
+        lines.push('');
+      }
+      if (Array.isArray(result.synthesis?.conclusions) && result.synthesis.conclusions.length > 0) {
+        lines.push('Conclusions:');
+        for (const item of result.synthesis.conclusions) lines.push(`- ${item}`);
+        lines.push('');
+      }
+      if (Array.isArray(result.synthesis?.unresolved) && result.synthesis.unresolved.length > 0) {
+        lines.push('Unresolved:');
+        for (const item of result.synthesis.unresolved) lines.push(`- ${item}`);
+        lines.push('');
+      }
+    }
+  }
+
+  if (Array.isArray(doc.magiVotes) && doc.magiVotes.length > 0) {
+    lines.push('## MAGI Votes');
+    lines.push('');
+    for (const vote of doc.magiVotes) {
+      lines.push(`### ${vote.name || vote.core}`);
+      lines.push('');
+      lines.push(`- Core: ${vote.core}`);
+      lines.push(`- Vote: ${vote.vote}`);
+      lines.push(`- Confidence: ${vote.confidence}`);
+      lines.push(`- Axis: ${vote.axis || ''}`);
+      lines.push(`- Rationale: ${vote.rationale || ''}`);
+      if (Array.isArray(vote.amendments) && vote.amendments.length > 0) {
+        lines.push('- Amendments:');
+        for (const item of vote.amendments) lines.push(`  - ${item}`);
+      }
+      lines.push('');
+    }
+  }
+
+  if (doc.finalReport) {
+    lines.push('## Final Report');
+    lines.push('');
+    lines.push(`- Majority Vote: ${doc.finalReport.majority_vote}`);
+    lines.push('');
+    lines.push(doc.finalReport.summary || '');
+    lines.push('');
+    lines.push(doc.finalReport.final_answer || '');
+    lines.push('');
+    if (Array.isArray(doc.finalReport.key_decisions) && doc.finalReport.key_decisions.length > 0) {
+      lines.push('Key Decisions:');
+      for (const item of doc.finalReport.key_decisions) lines.push(`- ${item}`);
+      lines.push('');
+    }
+    if (Array.isArray(doc.finalReport.implementation_path) && doc.finalReport.implementation_path.length > 0) {
+      lines.push('Implementation Path:');
+      for (const item of doc.finalReport.implementation_path) lines.push(`- ${item}`);
+      lines.push('');
+    }
+    if (Array.isArray(doc.finalReport.residual_risks) && doc.finalReport.residual_risks.length > 0) {
+      lines.push('Residual Risks:');
+      for (const item of doc.finalReport.residual_risks) lines.push(`- ${item}`);
+      lines.push('');
+    }
+  }
+
+  lines.push('## Transcript');
+  lines.push('');
+  for (const turn of doc.transcript || []) {
+    lines.push(`### ${String(turn.id).padStart(4, '0')} | ${turn.isoTime} | ${(turn.channel || 'system').toUpperCase()} | ${turn.kind}`);
+    lines.push('');
+    lines.push(`- Direction: ${turn.direction || 'event'}`);
+    lines.push(`- Team: ${turn.teamName || turn.teamId || 'n/a'}`);
+    lines.push(`- Agent: ${turn.agentName || turn.agentId || 'n/a'}`);
+    lines.push(`- Model: ${turn.model || 'n/a'}`);
+    lines.push(`- Fallback: ${Boolean(turn.fallback)}`);
+    lines.push('');
+    if (turn.title) {
+      lines.push(`Title: ${turn.title}`);
+      lines.push('');
+    }
+    if (turn.text) {
+      lines.push('```text');
+      lines.push(sanitizeFenceText(turn.text));
+      lines.push('```');
+      lines.push('');
+    }
+    if (turn.data) {
+      lines.push('```json');
+      lines.push(sanitizeFenceText(safeJsonStringify(turn.data, 2)));
+      lines.push('```');
+      lines.push('');
+    }
+  }
+
+  return lines.join('\n');
+}
+
+async function persistSessionArchive(sessionId) {
+  const session = getSessionOrNull(sessionId);
+  if (!session) return;
+  await ensureRuntimeDirs();
+  const doc = buildSessionArchiveDocument(session);
+  const markdown = buildSessionArchiveMarkdown(session);
+  const files = buildArchiveAbsolutePaths(sessionId);
+  await Promise.all([
+    fsp.writeFile(files.json, `${safeJsonStringify(doc, 2)}\n`, 'utf8'),
+    fsp.writeFile(files.markdown, `${markdown}\n`, 'utf8'),
+  ]);
+}
+
+function scheduleSessionPersist(sessionId, delay = 120) {
+  if (!sessionId) return;
+  const existing = persistTimers.get(sessionId);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    persistTimers.delete(sessionId);
+    void persistSessionArchive(sessionId).catch((error) => {
+      console.warn(`Failed to persist session archive ${sessionId}: ${error?.message || String(error)}`);
+    });
+  }, delay);
+  persistTimers.set(sessionId, timer);
+}
+
+function sendSessionArchiveExport(res, session, format = 'json') {
+  const normalized = format === 'md' || format === 'markdown' ? 'md' : 'json';
+  const filename = `magi-session-${session.id}.${normalized === 'md' ? 'md' : 'json'}`;
+  if (normalized === 'md') {
+    const markdown = buildSessionArchiveMarkdown(session);
+    res.writeHead(200, {
+      'Content-Type': 'text/markdown; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Cache-Control': 'no-store',
+    });
+    res.end(markdown);
+    return;
+  }
+
+  const doc = buildSessionArchiveDocument(session);
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Cache-Control': 'no-store',
+  });
+  res.end(`${safeJsonStringify(doc, 2)}\n`);
 }
 
 function getSessionOrNull(sessionId) {
@@ -2324,13 +3666,16 @@ function emit(sessionId, event, payload) {
   const session = getSessionOrNull(sessionId);
   if (!session) return;
   const entry = {
-    id: session.history.length + 1,
+    id: (session.eventSeq = Number(session.eventSeq || 0) + 1),
     event,
     payload,
     ts: Date.now(),
   };
   session.history.push(entry);
-  session.history = session.history.slice(-800);
+  session.history = session.history.slice(-MAX_EVENT_HISTORY);
+  session.archive.stats.eventCount = Number(session.archive.stats.eventCount || 0) + 1;
+  touchArchive(session.archive);
+  scheduleSessionPersist(sessionId);
   for (const client of session.clients) {
     writeSSE(client, entry);
   }

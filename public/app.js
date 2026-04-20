@@ -13,7 +13,7 @@ const PRESETS = [
   '設計一個可用於 research / coding / architecture review 的 MAGI runtime，要求具備 web_search、structured outputs、真實 LLM 評議與投票。',
 ];
 
-const UI_STORAGE_KEY = 'magi-eva-ui-v4';
+const UI_STORAGE_KEY = 'magi-eva-ui-v5';
 
 const state = {
   config: null,
@@ -34,6 +34,8 @@ const state = {
     'casper-3': { core: 'casper-3', name: 'CASPER-3', axis: 'Woman axis', status: 'idle', vote: 'PENDING' },
   },
   finalResult: null,
+  archive: null,
+  archiveRefreshTimer: null,
   apiBase: '',
   ui: {
     collapsedPanels: new Set(),
@@ -88,6 +90,11 @@ const refs = {
   teamCardTemplate: $('#teamCardTemplate'),
   orbitNodeTemplate: $('#orbitNodeTemplate'),
   clearLogButton: $('#clearLogButton'),
+  refreshArchiveButton: $('#refreshArchiveButton'),
+  exportJsonButton: $('#exportJsonButton'),
+  exportMarkdownButton: $('#exportMarkdownButton'),
+  archiveSummary: $('#archiveSummary'),
+  archiveTranscript: $('#archiveTranscript'),
   expandTeamsButton: $('#expandTeamsButton'),
   collapseTeamsButton: $('#collapseTeamsButton'),
   hudTeamCount: $('#hudTeamCount'),
@@ -133,6 +140,7 @@ async function init() {
   renderBlackboard();
   renderTeams();
   renderDecisionMemo();
+  renderArchive();
   renderVotes();
   renderEventLog();
   renderHud();
@@ -149,6 +157,19 @@ function bindUi() {
   refs.clearLogButton.addEventListener('click', () => {
     state.logs = [];
     renderEventLog();
+  });
+
+  refs.refreshArchiveButton.addEventListener('click', async () => {
+    await loadArchiveSummary(true);
+    addClientLog('info', 'Session archive refreshed.');
+  });
+
+  refs.exportJsonButton.addEventListener('click', () => {
+    exportArchive('json');
+  });
+
+  refs.exportMarkdownButton.addEventListener('click', () => {
+    exportArchive('md');
   });
 
   refs.expandTeamsButton.addEventListener('click', () => {
@@ -278,6 +299,7 @@ async function createFreshSession() {
   connectEventSource(payload.sessionId);
   setDot(refs.dotSession, 'busy');
   refs.sessionStatus.textContent = 'STREAMING';
+  await loadArchiveSummary(true);
 }
 
 function disconnectEventSource() {
@@ -296,6 +318,11 @@ function resetRuntimeState() {
   state.blackboard = [];
   state.logs = [];
   state.finalResult = null;
+  state.archive = null;
+  if (state.archiveRefreshTimer) {
+    clearTimeout(state.archiveRefreshTimer);
+    state.archiveRefreshTimer = null;
+  }
   state.phases = new Map(PHASE_DEFS.map((phase) => [phase.key, { ...phase, status: 'idle' }]));
   state.votes = {
     'melchior-1': { core: 'melchior-1', name: 'MELCHIOR-1', axis: 'Scientist axis', status: 'idle', vote: 'PENDING' },
@@ -312,6 +339,7 @@ function resetRuntimeState() {
   renderBlackboard();
   renderTeams();
   renderDecisionMemo();
+  renderArchive();
   renderEventLog();
   renderVotes();
   renderOrbit();
@@ -366,6 +394,9 @@ function connectEventSource(sessionId) {
 }
 
 function handleEvent(type, payload) {
+  if (type !== 'log') {
+    queueArchiveRefresh(type === 'final_result' ? 60 : 220);
+  }
   switch (type) {
     case 'session_init': {
       refs.sessionTag.textContent = `SESSION // ${shortId(payload.sessionId)}`;
@@ -700,6 +731,100 @@ function renderDecisionMemo() {
     ${renderListSection('Implementation path', report.implementation_path)}
     ${renderListSection('Residual risks', report.residual_risks)}
   `;
+}
+
+async function loadArchiveSummary(force = false) {
+  if (!state.sessionId) {
+    state.archive = null;
+    renderArchive();
+    return null;
+  }
+  try {
+    const payload = await api(`/api/archive?session=${encodeURIComponent(state.sessionId)}`);
+    state.archive = payload;
+    renderArchive();
+    return payload;
+  } catch (error) {
+    console.error('Archive load failed', error);
+    if (force) {
+      addClientLog('error', `Archive load failed: ${error.message}`);
+    }
+    return null;
+  }
+}
+
+function queueArchiveRefresh(delay = 260) {
+  if (!state.sessionId) return;
+  if (state.archiveRefreshTimer) {
+    clearTimeout(state.archiveRefreshTimer);
+  }
+  state.archiveRefreshTimer = setTimeout(() => {
+    state.archiveRefreshTimer = null;
+    void loadArchiveSummary(false);
+  }, delay);
+}
+
+function exportArchive(format = 'json') {
+  if (!state.sessionId) {
+    addClientLog('error', 'Session is not ready.');
+    return;
+  }
+  const anchor = document.createElement('a');
+  anchor.href = `/api/export?session=${encodeURIComponent(state.sessionId)}&format=${encodeURIComponent(format)}`;
+  anchor.rel = 'noopener';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+function renderArchive() {
+  if (!refs.archiveSummary || !refs.archiveTranscript) return;
+  if (!state.archive) {
+    refs.archiveSummary.innerHTML = '<div class="empty-state">No archive loaded.</div>';
+    refs.archiveTranscript.innerHTML = '<div class="empty-state">No recorded dialogue yet.</div>';
+    return;
+  }
+
+  const stats = state.archive.stats || {};
+  const fileInfo = state.archive.files || {};
+  refs.archiveSummary.innerHTML = `
+    <div class="archive-summary__grid mono small">
+      <div><span class="label-key">UPDATED</span><span>${escapeHtml(state.archive.updatedAt || '--')}</span></div>
+      <div><span class="label-key">EVENTS</span><span>${escapeHtml(String(stats.eventCount || 0))}</span></div>
+      <div><span class="label-key">TURNS</span><span>${escapeHtml(String(stats.transcriptTurns || 0))}</span></div>
+      <div><span class="label-key">CALLS</span><span>${escapeHtml(String(stats.modelCalls || 0))}</span></div>
+      <div><span class="label-key">TEAMS</span><span>${escapeHtml(String(stats.teamCount || 0))}</span></div>
+      <div><span class="label-key">AGENTS</span><span>${escapeHtml(String(stats.agentCount || 0))}</span></div>
+    </div>
+    <div class="archive-summary__meta mono small">
+      <div>JSON // ${escapeHtml(fileInfo.json || 'data/sessions/<session>.json')}</div>
+      <div>MD // ${escapeHtml(fileInfo.markdown || 'data/sessions/<session>.md')}</div>
+    </div>
+    ${state.archive.finalReport?.summary ? `<div class="archive-summary__final">${escapeHtml(state.archive.finalReport.summary)}</div>` : ''}
+  `;
+
+  const turns = Array.isArray(state.archive.recentTranscript) ? state.archive.recentTranscript : [];
+  if (turns.length === 0) {
+    refs.archiveTranscript.innerHTML = '<div class="empty-state">No recorded dialogue yet.</div>';
+    return;
+  }
+
+  refs.archiveTranscript.innerHTML = turns
+    .map((turn) => {
+      const actor = turn.agentName || turn.agentId || turn.teamName || turn.teamId || turn.channel || 'system';
+      const meta = [turn.isoTime || '--', (turn.direction || 'event').toUpperCase(), actor, turn.model || 'n/a']
+        .filter(Boolean)
+        .join(' / ');
+      const title = turn.title || `${turn.channel || 'system'} / ${turn.kind || 'note'}`;
+      return `
+        <article class="archive-entry ${escapeHtml(turn.direction || 'event')}">
+          <div class="archive-entry__meta">${escapeHtml(meta)}</div>
+          <div class="archive-entry__title">${escapeHtml(title)}</div>
+          <div class="archive-entry__text">${escapeHtml(compactText(turn.text || '', 240) || '(empty)')}</div>
+        </article>
+      `;
+    })
+    .join('');
 }
 
 function renderTeams() {
@@ -1148,7 +1273,7 @@ function saveUiState() {
 
 function applyResponsiveDefaults() {
   if (window.innerWidth <= 900) {
-    ['presets', 'blackboard', 'eventsPanel'].forEach((id) => {
+    ['presets', 'blackboard', 'archive', 'eventsPanel'].forEach((id) => {
       if (id.endsWith('Panel')) {
         state.ui.collapsedPanels.add(id);
       } else {

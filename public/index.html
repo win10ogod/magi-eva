@@ -132,6 +132,11 @@
                     <button id="runButton" class="primary-button">START MAGI CYCLE</button>
                     <button id="newSessionButton" class="secondary-button">NEW SESSION</button>
                   </div>
+                  <div class="button-row button-row--archive">
+                    <button id="refreshArchiveButton" class="secondary-button">REFRESH RECORDS</button>
+                    <button id="exportJsonButton" class="secondary-button">EXPORT JSON</button>
+                    <button id="exportMarkdownButton" class="secondary-button">EXPORT MD</button>
+                  </div>
 
                   <div class="info-list mono small">
                     <div><span class="label-key">API BASE</span><span id="apiBaseValue">--</span></div>
@@ -250,6 +255,17 @@
               </button>
               <div class="fold-body">
                 <div id="decisionMemo" class="decision-memo">No final report yet.</div>
+              </div>
+            </section>
+
+            <section class="fold-block" data-fold="archive">
+              <button type="button" class="fold-toggle" data-fold-toggle="archive">
+                <span>SESSION ARCHIVE</span>
+                <span class="fold-toggle__meta">對話記錄</span>
+              </button>
+              <div class="fold-body">
+                <div id="archiveSummary" class="archive-summary">No archive loaded.</div>
+                <div id="archiveTranscript" class="archive-transcript mono"></div>
               </div>
             </section>
           </div>

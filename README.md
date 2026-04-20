@@ -1,58 +1,186 @@
-# MAGI EVA Runtime v4
+# MAGI EVA Runtime v5
 
-EVA 風格的多代理運行原型，包含：
-- 動態子代理生成
-- 動態多團隊生成
-- 多種協作模式：roundtable / experts / debate / hierarchy / swarm / dag
-- MAGI 三核心仲裁
-- 可摺疊控制區、遙測區、團隊區、事件區
-- 自適應舞台布局
-- 真實 OpenAI Responses API 路徑，無 API key 時自動退回本地 fallback
+MAGI EVA Runtime v5 is an EVA-inspired multi-agent orchestration console for JavaScript runtimes. It combines dynamic sub-agent generation, dynamic multi-team generation, multiple collaboration patterns, MAGI-style arbitration, and a full session archive system.
 
-## 啟動
+## Core capabilities
+
+- Dynamic sub-agent generation
+- Dynamic multi-team generation, with up to 6 teams in one run
+- Collaboration patterns:
+  - roundtable
+  - experts
+  - debate
+  - hierarchy
+  - swarm
+  - dag
+- MAGI three-core arbitration:
+  - MELCHIOR-1
+  - BALTHASAR-2
+  - CASPER-3
+- Responsive EVA/MAGI interface with collapsible panels and sections
+- Real OpenAI Responses API path
+- Demo fallback path when no API key is configured or a live call fails
+- Full session recording and archive export
+
+## Recording and archive system
+
+v5 adds a persistent recording layer for every session.
+
+The runtime now records:
+
+- topology planner request and response
+- every agent prompt and response
+- every task planner request and response
+- every team synthesis prompt and response
+- MAGI vote prompts and responses
+- final report prompt and response
+- blackboard notes
+- runtime event history
+
+Archives are written automatically to:
+
+```text
+data/sessions/<session-id>.json
+data/sessions/<session-id>.md
+```
+
+The UI also provides:
+
+- Refresh Records
+- Export JSON
+- Export MD
+- Session Archive panel with recent dialogue turns
+
+## Quick start
+
+### Windows PowerShell
 
 ```powershell
-cd C:\Users\jmes1\桌面\magi-eva-v4
+cd C:\Users\jmes1\桌面\magi-eva-v5
 copy .env.example .env
-# 填入 OPENAI_API_KEY
+# Fill in OPENAI_API_KEY if you want live mode
 node .\server.mjs
 ```
 
-如果 3000 被占用，伺服器會自動切換到下一個可用埠。
+If port 3000 is already in use, the server automatically switches to the next available port.
 
-也可以指定埠：
+You can also choose a port manually:
 
 ```powershell
 node .\server.mjs --port 3100
 ```
 
-或：
+or:
 
 ```powershell
 .\start.ps1 -Port 3100
 ```
 
-## 本版重點
+## Environment variables
 
-### 介面
-- 設定、面板、操作按鈕支援摺疊
-- 各團隊卡片可單獨展開 / 收合
-- 小螢幕自動切換更緊湊布局
-- HUD 顯示團隊數、代理數、任務數、模式覆蓋
-- 保留 EVA / MAGI 風格舞台、雷達、光暈、決策室視覺
+```env
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
+HOST=127.0.0.1
+PORT=3000
+MAGI_PLANNER_MODEL=gpt-5.4
+MAGI_WORKER_MODEL=gpt-5.4-mini
+MAGI_JUDGE_MODEL=gpt-5.4
+MAGI_SWARM_MODEL=gpt-5.4-mini
+```
 
-### 核心
-- planner 回傳不完整 topology 時會自動補齊
-- 依 pattern 自動生成缺失的 synthetic sub-agents
-- 團隊數不足時會自動補 synthetic teams
-- 依賴關係會自動修復，避免死結
-- 同層並行團隊只讀取已完成依賴結果，不再混入未授權上游資料
-- live 模式無 API key 時不會中斷，會進入 fallback 鏈路
+Model selection is no longer exposed in the UI. It is controlled only through `.env`.
 
-## 模型設定
+## Session archive endpoints
 
-模型不再從介面配置，改由 `.env` 控制：
-- `MAGI_PLANNER_MODEL`
-- `MAGI_WORKER_MODEL`
-- `MAGI_JUDGE_MODEL`
-- `MAGI_SWARM_MODEL`
+### Archive summary
+
+```text
+GET /api/archive?session=<session-id>
+```
+
+Returns a live summary of:
+
+- archive stats
+- recent transcript turns
+- team result summaries
+- MAGI vote summaries
+- final report summary
+- export URLs
+
+### Export JSON archive
+
+```text
+GET /api/export?session=<session-id>&format=json
+```
+
+### Export Markdown archive
+
+```text
+GET /api/export?session=<session-id>&format=md
+```
+
+## What is included in the JSON archive
+
+- mission
+- runtime config
+- topology
+- stats
+- team results
+- MAGI votes
+- final report
+- blackboard entries
+- chronological transcript
+- model call records
+- event history
+- export file metadata
+
+## UI notes
+
+- The interface is responsive and adaptive.
+- Panels and sections can be folded.
+- Team cards can be expanded or collapsed individually.
+- The Session Archive panel shows recent dialogue records.
+- Export buttons are available in the console actions section.
+
+## Directory layout
+
+```text
+magi-eva-v5/
+├─ server.mjs
+├─ start.ps1
+├─ README.md
+├─ README_zh.md
+├─ .env.example
+├─ data/
+│  └─ sessions/
+└─ public/
+   ├─ index.html
+   ├─ styles.css
+   └─ app.js
+```
+
+## Runtime modes
+
+### Live mode
+
+Uses the real OpenAI Responses API path.
+
+### Demo mode
+
+Uses local fallback outputs while keeping the orchestration flow, event stream, archive generation, and export functions intact.
+
+## Recommended validation steps
+
+1. Start a new session.
+2. Run one MAGI cycle in demo mode.
+3. Open the Session Archive panel.
+4. Confirm that recent turns are visible.
+5. Export JSON and Markdown.
+6. Check that `data/sessions/` contains both files.
+
+## Notes
+
+- Session archives can become large because every prompt and response is preserved.
+- Demo mode still records complete archives.
+- If live calls fail, the runtime falls back locally and still records the fallback path.
